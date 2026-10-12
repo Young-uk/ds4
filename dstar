@@ -60,7 +60,7 @@ usage: dstar <command> [options]
       --no-mtp           plain decoding without the speculative MTP block
       --no-vision        do not load the vision encoder
       --ane              run part of the prompt processing on the Neural
-                         Engine: about 25% faster prefill, 0.8 GB more memory
+                         Engine: about 30% faster prefill, 0.9 GB more memory
       --power N          keep the GPU busy N% of the time, 1..100: a cooler
                          and quieter Mac for a proportionally slower model
       NAME or FILE       serve another model instead: a GGUF path or a word
@@ -324,7 +324,7 @@ cmd_serve() {
             --lan) HOST=0.0.0.0 ;;
             --no-mtp) mtp=0 ;;
             --no-vision) vision=0 ;;
-            --ane) ane=1; ANE_GIB=0.8 ;;
+            --ane) ane=1; ANE_GIB=0.9 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
             --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;

@@ -130,6 +130,10 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   to 467 tok/s at 8K and from 416 to 442 at 32K (Q2_0, 373 and 359 on the
   GPU alone), for 0.4 GB more memory: a second set of surfaces and the
   first chunk's rows. `DS4_ANE_PIPE=0` goes back to one chunk at a time.
+  Each layer then runs in three phases, so the output projections, ssm_out
+  and attn_output, also go to the Neural Engine behind the other chunk's
+  attention-side mix, all but their first 768 columns: 495 tok/s at 8K and
+  467 at 32K, for 0.1 GB more.
 
 Each change is a separate commit with a test.
 
