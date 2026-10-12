@@ -50944,7 +50944,11 @@ typedef struct {
     ds4_ane_surface x, y;
     ds4_ane_surface w[3];   /* n_w weight surfaces, staged per slot by the GPU */
     id<MTLBuffer> scales;   /* n_slots * N floats */
-    uint64_t pending_done;  /* value the GPU waits on before unpacking */
+    /* The evaluations signal the program's own event, in order, so the GPU's
+     * wait for one cannot pass on the signal of another program or of the
+     * GPU itself. */
+    id<MTLSharedEvent> done_ev;
+    uint64_t done_seq;      /* last value queued on done_ev */
 } ds4_ane_prog;
 
 #define DS4_ANE_MAX_PROGS 16
@@ -50962,8 +50966,8 @@ static struct {
     Class<DS4AneEvents> events_class, signal_class, wait_class;
     ds4_ane_prog prog[DS4_ANE_MAX_PROGS];
     int n_prog;
-    id<MTLSharedEvent> event;
-    uint64_t seq, last_ready;
+    id<MTLSharedEvent> event;          /* the GPU's input-ready signals only */
+    uint64_t seq, last_ready;          /* seq also numbers the evaluations */
     _Atomic int failed;
     uint64_t evals;                    /* queued */
     _Atomic uint64_t completed;        /* finished, failed or timed out */
@@ -51111,7 +51115,8 @@ int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots) {
     @autoreleasepool {
         ds4_ane_prog *p = &g_ane.prog[g_ane.n_prog];
         p->K = K; p->N = N; p->R = R; p->n_slots = n_slots;
-        if (!ds4_ane_make_surface(&p->x, R, K, 2) || !ds4_ane_make_surface(&p->y, R, N, 2)) {
+        if (!(p->done_ev = [g_device newSharedEvent]) ||
+            !ds4_ane_make_surface(&p->x, R, K, 2) || !ds4_ane_make_surface(&p->y, R, N, 2)) {
             fprintf(stderr, "ds4: ANE: surface allocation failed\n");
             return -1;
         }
@@ -51158,7 +51163,8 @@ int ds4_gpu_ane_create_ffn(uint32_t K, uint32_t F, uint32_t R, uint32_t n_slots)
     @autoreleasepool {
         ds4_ane_prog *p = &g_ane.prog[g_ane.n_prog];
         p->kind = 1; p->K = K; p->N = K; p->F = F; p->R = R; p->n_slots = n_slots; p->n_w = 3;
-        if (!ds4_ane_make_surface(&p->x, R, K, 2) || !ds4_ane_make_surface(&p->y, R, K, 2)) return -1;
+        if (!(p->done_ev = [g_device newSharedEvent]) ||
+            !ds4_ane_make_surface(&p->x, R, K, 2) || !ds4_ane_make_surface(&p->y, R, K, 2)) return -1;
         if (!ds4_ane_make_surface(&p->w[0], F, K, 2) || !ds4_ane_make_surface(&p->w[1], F, K, 2) ||
             !ds4_ane_make_surface(&p->w[2], K, F, 2)) return -1;
         p->scales = [g_device newBufferWithLength:(NSUInteger)n_slots * K * sizeof(float) options:MTLResourceStorageModeShared];
@@ -51344,18 +51350,23 @@ static bool ds4_ane_finish(uint64_t done) {
     return false;
 }
 
-static void ds4_ane_fail(uint64_t done, const char *why) {
+/* Stops the ANE for the session and releases every wait the GPU has or
+ * will encode for the evaluations queued so far. */
+static void ds4_ane_fail(const char *why) {
     if (!atomic_exchange(&g_ane.failed, 1))
         fprintf(stderr, "ds4: ANE evaluation %s; the GPU runs the prefill alone from now on\n", why);
-    if (g_ane.event.signaledValue < done) g_ane.event.signaledValue = done;
+    for (int h = 0; h < g_ane.n_prog; h++) {
+        ds4_ane_prog *p = &g_ane.prog[h];
+        if (p->done_ev && p->done_ev.signaledValue < p->done_seq) p->done_ev.signaledValue = p->done_seq;
+    }
 }
 
 int ds4_gpu_ane_settle(void) {
     if (!g_ane.resolved || g_ane.resolved < 0) return 1;
     for (int i = 0; i < 3000 && atomic_load(&g_ane.completed) < g_ane.evals; i++) usleep(1000);
     uint32_t *status = [g_ane.status contents];
-    if (atomic_load(&g_ane.completed) < g_ane.evals) ds4_ane_fail(g_ane.seq, "did not finish");
-    else if (*status) ds4_ane_fail(g_ane.seq, "wrote non-finite rows");
+    if (atomic_load(&g_ane.completed) < g_ane.evals) ds4_ane_fail("did not finish");
+    else if (*status) ds4_ane_fail("wrote non-finite rows");
     *status = 0;
     return !g_ane.failed;
 }
@@ -51387,8 +51398,9 @@ int ds4_gpu_ane_eval(int h, uint32_t slot, int xh, uint32_t T) {
         uint32_t b = 0;
         while (b + 1 < p->n_proc && p->proc_rows[b] < T) b++;
         if (T == 0 || p->proc_rows[b] < T) return 0;
-        const uint64_t ready = g_ane.last_ready, done = ++g_ane.seq;
-        id ev_signal = [g_ane.signal_class signalEventWithValue:done symbolIndex:0 eventType:0 sharedEvent:g_ane.event];
+        const uint64_t ready = g_ane.last_ready, done = ++g_ane.seq, value = p->done_seq + 1u;
+        id<MTLSharedEvent> done_ev = p->done_ev;
+        id ev_signal = [g_ane.signal_class signalEventWithValue:value symbolIndex:0 eventType:0 sharedEvent:done_ev];
         id ev_wait = [g_ane.wait_class waitEventWithValue:ready sharedEvent:g_ane.event eventType:0];
         id events = [g_ane.events_class sharedEventsWithSignalEvents:@[ ev_signal ] waitEvents:@[ ev_wait ]];
         NSMutableArray *ins = [NSMutableArray array];
@@ -51405,36 +51417,36 @@ int ds4_gpu_ane_eval(int h, uint32_t slot, int xh, uint32_t T) {
         if (!events || !req) return 0;
         [req setCompletionHandler:^(BOOL ok, NSError *e) {
             if (ds4_ane_finish(done) && !ok)
-                ds4_ane_fail(done, [NSString stringWithFormat:@"failed (%@)", e ? e.localizedDescription : @"no reason"].UTF8String);
+                ds4_ane_fail([NSString stringWithFormat:@"failed (%@)", e ? e.localizedDescription : @"no reason"].UTF8String);
         }];
         /* The watchdog starts when the GPU signals the input ready, and so
          * do the test faults, as a real evaluation would. */
         const int fault = ds4_ane_test_fault();
         ds4_ane_prog *pf = p;
         [g_ane.event notifyListener:g_ane.listener atValue:ready block:^(id<MTLSharedEvent> ev, uint64_t v) {
-            (void)v;
+            (void)ev; (void)v;
             if (fault == 1) {
-                if (ds4_ane_finish(done)) ds4_ane_fail(done, "failed (test)");
+                if (ds4_ane_finish(done)) ds4_ane_fail("failed (test)");
                 return;
             }
             if (fault == 2) {
                 uint16_t *y = pf->y.buffer.contents;
                 for (uint64_t i = 0; i < pf->y.buffer.length / 2u; i++) y[i] = 0x7e00u;
                 ds4_ane_finish(done);
-                if (ev.signaledValue < done) ev.signaledValue = done;
+                if (done_ev.signaledValue < value) done_ev.signaledValue = value;
                 return;
             }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)DS4_ANE_TIMEOUT_NS), g_ane.queue, ^{
-                if (ds4_ane_finish(done)) ds4_ane_fail(done, "timed out");
+                if (ds4_ane_finish(done)) ds4_ane_fail("timed out");
             });
         }];
         g_ane.evals++;
-        p->pending_done = done;
+        p->done_seq = value;
         if (fault == 0) {
             NSError *err = nil;
             if (![g_ane.client evaluateWithModel:p->model options:@{} request:req qos:21 error:&err] &&
                 ds4_ane_finish(done)) {
-                ds4_ane_fail(done, [NSString stringWithFormat:@"was not queued (%@)", err.localizedDescription].UTF8String);
+                ds4_ane_fail([NSString stringWithFormat:@"was not queued (%@)", err.localizedDescription].UTF8String);
             }
         }
     }
@@ -51451,7 +51463,7 @@ int ds4_gpu_ane_unpack(int h, uint32_t slot, ds4_gpu_tensor *out, uint32_t T, ui
     if (slot >= p->n_slots || col0 + p->N > ld) return 0;
     @autoreleasepool {
         ds4_gpu_close_batch_encoder();
-        [g_batch_cb encodeWaitForEvent:g_ane.event value:p->pending_done];
+        [g_batch_cb encodeWaitForEvent:p->done_ev value:p->done_seq];
         __unsafe_unretained id<MTLBuffer> bufs[4] = { p->y.buffer, ds4_gpu_tensor_buffer(out), p->scales,
                                   gpu_part ? ds4_gpu_tensor_buffer(gpu_part) : nil };
         const NSUInteger offs[4] = { 0, ds4_gpu_tensor_offset(out), (NSUInteger)slot * p->N * sizeof(float),
