@@ -58119,6 +58119,11 @@ typedef struct ds4_qwen4_gpu_graph {
     int ane_ple_prev[DS4_MAX_PLE_NGRAM];
     uint32_t ane_pos;
     int32_t ane_mrope_delta;
+    /* Two prefill chunks in flight (qwen4_graph_forward_pair): the leading
+     * chunk's rows that live across a layer's phases, and whether the ANE
+     * already took the current chunk's input projections. */
+    ds4_gpu_tensor *pipe_R, *pipe_inj, *pipe_mixed, *pipe_ple_emb;
+    bool ane_kicked;
     uint32_t mtp_pos;
     uint32_t n_logit_rows;
     bool snap_after_first;   /* set by the caller for a 2-token verify: snapshot the state after row 0 */
@@ -58298,6 +58303,11 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->ane_lin_hist[il]);
     }
     ds4_gpu_tensor_free(g->ane_ple_hist);
+    ds4_gpu_tensor_free(g->pipe_R);
+    ds4_gpu_tensor_free(g->pipe_inj);
+    ds4_gpu_tensor_free(g->pipe_mixed);
+    ds4_gpu_tensor_free(g->pipe_ple_emb);
+    g->pipe_R = g->pipe_inj = g->pipe_mixed = g->pipe_ple_emb = NULL;
     free(g->host_logits);
     memset(g, 0, sizeof(*g));
 }
@@ -58863,7 +58873,9 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * once both finish.  DS4_ANE_QKV, DS4_ANE_ATTNQ and DS4_ANE_SSMOUT set the
  * GPU's columns (0 keeps the whole projection on the GPU), DS4_ANE_SHEXP=0
  * keeps the shared expert there and DS4_ANE_MIN_ROWS is the smallest chunk
- * the ANE takes.  The defaults balance the two on an M1 Max. */
+ * the ANE takes.  Chunks run in pairs (qwen4_graph_forward_pair) unless
+ * DS4_ANE_PIPE=0, with their own split defaults.  The defaults balance the
+ * two on an M1 Max. */
 #ifdef DS4_HAS_QWEN4_METAL
 #define QWEN4_ANE_ROWS 2048u
 
@@ -58876,6 +58888,7 @@ static struct {
     int slot[DS4_MAX_LAYER];           /* index among the GDN layers, -1 attention */
     int aslot[DS4_MAX_LAYER];          /* index among the attention layers, -1 GDN */
     int moe_layer;                     /* the trunk layer qwen4_graph_moe runs, -1 other */
+    bool pipe;                         /* two surface sets: chunks run in pairs */
 } g_qwen4_ane = { .state = -1, .z = -1, .qkv = -1, .q = -1, .out = -1, .sh = -1, .moe_layer = -1 };
 
 static uint32_t qwen4_ane_env(const char *name, uint32_t def) {
@@ -58922,12 +58935,17 @@ static bool qwen4_ane_build(const ds4_model *m, const ds4_weights *w) {
     }
     if (!lg) return false;
     const double t0 = now_sec();
+    g_qwen4_ane.pipe = qwen4_ane_env("DS4_ANE_PIPE", 1u) != 0 && ds4_gpu_ane_set_count(2);
     const uint32_t K = (uint32_t)lg->lin_gate->dim[0];
     const uint32_t Nqkv = (uint32_t)lg->lin_qkv->dim[1], No = (uint32_t)lg->lin_out->dim[1];
     const uint32_t Nq = la ? (uint32_t)la->attn_q->dim[1] : 0u;
-    g_qwen4_ane.qkv_gpu = qwen4_ane_split("DS4_ANE_QKV", 5120u, Nqkv);
-    g_qwen4_ane.q_gpu = la ? qwen4_ane_split("DS4_ANE_ATTNQ", 6144u, Nq) : 0u;
-    g_qwen4_ane.out_gpu = qwen4_ane_split("DS4_ANE_SSMOUT", 1536u, No);
+    /* In pairs the ANE's share of the input projections has a whole phase of
+     * the other chunk to finish in, so it takes nearly all of them; ssm_out,
+     * read right after it is queued, stays on the GPU. */
+    const bool pipe = g_qwen4_ane.pipe;
+    g_qwen4_ane.qkv_gpu = qwen4_ane_split("DS4_ANE_QKV", pipe ? 256u : 5120u, Nqkv);
+    g_qwen4_ane.q_gpu = la ? qwen4_ane_split("DS4_ANE_ATTNQ", pipe ? 256u : 6144u, Nq) : 0u;
+    g_qwen4_ane.out_gpu = qwen4_ane_split("DS4_ANE_SSMOUT", pipe ? 0u : 1536u, No);
     g_qwen4_ane.z = ds4_gpu_ane_create(K, (uint32_t)lg->lin_gate->dim[1], QWEN4_ANE_ROWS, n_gdn);
     if (g_qwen4_ane.z < 0) return false;
     if (g_qwen4_ane.qkv_gpu &&
@@ -58976,8 +58994,8 @@ static bool qwen4_ane_build(const ds4_model *m, const ds4_weights *w) {
     if (g_qwen4_ane.q >= 0) n += snprintf(what + n, sizeof what - n, ", attn_q from %u", g_qwen4_ane.q_gpu);
     if (g_qwen4_ane.out >= 0) n += snprintf(what + n, sizeof what - n, ", ssm_out from %u", g_qwen4_ane.out_gpu);
     if (g_qwen4_ane.sh >= 0) snprintf(what + n, sizeof what - n, ", the shared expert");
-    fprintf(stderr, "ds4: Neural Engine prefill ready in %.2f s (%s; chunks of %u to %u rows)\n",
-            now_sec() - t0, what, g_qwen4_ane.min_rows, QWEN4_ANE_ROWS);
+    fprintf(stderr, "ds4: Neural Engine prefill ready in %.2f s (%s; chunks of %u to %u rows%s)\n",
+            now_sec() - t0, what, g_qwen4_ane.min_rows, QWEN4_ANE_ROWS, g_qwen4_ane.pipe ? ", in pairs" : "");
     return true;
 }
 
@@ -58999,6 +59017,17 @@ static void qwen4_ane_off(void) {
     g_qwen4_ane.state = 0;
 }
 
+/* Prefill chunks run in pairs, the second one layer behind the first, so
+ * the ANE works on one while the GPU runs the other (DS4_ANE_PIPE=0 runs
+ * them one at a time). */
+static bool qwen4_ane_pipe(void) {
+    return g_qwen4_ane.state == 1 && g_qwen4_ane.pipe && !ds4_gpu_ane_failed();
+}
+
+static void qwen4_ane_use_set(int s) {
+    if (g_qwen4_ane.pipe) (void)ds4_gpu_ane_use_set(s);
+}
+
 /* out = x W^T with W's trailing rows on the ANE and its leading gpu_cols on
  * the GPU. */
 static bool qwen4_ane_split_gemv(int h, int slot, uint32_t gpu_cols, ds4_gpu_tensor *out, const ds4_model *m,
@@ -59010,18 +59039,28 @@ static bool qwen4_ane_split_gemv(int h, int slot, uint32_t gpu_cols, ds4_gpu_ten
            ds4_gpu_ane_unpack(h, (uint32_t)slot, out, T, (uint32_t)w->dim[1], gpu_cols, g_qwen4_ane.part, gpu_cols);
 }
 
-/* GDN layer input: z on the ANE, and qkv split with it, while the GPU
- * computes its qkv columns; qkv is joined on return, z by qwen4_ane_gdn_z. */
+/* GDN layer input: z on the ANE, and qkv split with it.  The kick queues
+ * the ANE's part; qwen4_ane_gdn_in then computes the GPU's qkv columns and
+ * joins qkv, z is read back by qwen4_ane_gdn_z. */
+static bool qwen4_ane_gdn_kick(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                               uint32_t il, uint32_t T) {
+    const uint32_t slot = (uint32_t)g_qwen4_ane.slot[il];
+    const int z = g_qwen4_ane.z, qkv = g_qwen4_ane.qkv;
+    return qwen4_ane_stage(z, slot, 0, m, l->lin_gate, 0) &&
+           (qkv < 0 || qwen4_ane_stage(qkv, slot, 0, m, l->lin_qkv, g_qwen4_ane.qkv_gpu)) &&
+           ds4_gpu_ane_pack(z, g->mixed, T) &&
+           (qkv < 0 || ds4_gpu_ane_eval(qkv, slot, z, T)) && ds4_gpu_ane_eval(z, slot, z, T);
+}
+
 static bool qwen4_ane_gdn_in(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                              uint32_t il, uint32_t T) {
     const uint32_t slot = (uint32_t)g_qwen4_ane.slot[il];
-    const int z = g_qwen4_ane.z, qkv = g_qwen4_ane.qkv;
-    if (!qwen4_ane_stage(z, slot, 0, m, l->lin_gate, 0) ||
-        (qkv >= 0 && !qwen4_ane_stage(qkv, slot, 0, m, l->lin_qkv, g_qwen4_ane.qkv_gpu)) ||
-        !ds4_gpu_ane_pack(z, g->mixed, T)) return false;
-    if (qkv < 0) return ds4_gpu_ane_eval(z, slot, z, T) && qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T);
-    return ds4_gpu_ane_eval(qkv, slot, z, T) && ds4_gpu_ane_eval(z, slot, z, T) &&
-           qwen4_gemv_rows(g_qwen4_ane.part, m, l->lin_qkv, g->mixed, T, g_qwen4_ane.qkv_gpu) &&
+    const int qkv = g_qwen4_ane.qkv;
+    const bool kicked = g->ane_kicked;
+    g->ane_kicked = false;
+    if (!kicked && !qwen4_ane_gdn_kick(g, m, l, il, T)) return false;
+    if (qkv < 0) return qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T);
+    return qwen4_gemv_rows(g_qwen4_ane.part, m, l->lin_qkv, g->mixed, T, g_qwen4_ane.qkv_gpu) &&
            ds4_gpu_ane_unpack(qkv, slot, g->qkv, T, (uint32_t)l->lin_qkv->dim[1], g_qwen4_ane.qkv_gpu,
                               g_qwen4_ane.part, g_qwen4_ane.qkv_gpu);
 }
@@ -59037,10 +59076,35 @@ static bool qwen4_ane_gdn_out(ds4_qwen4_gpu_graph *g, const ds4_model *m, const 
                                 l->lin_out, g->lin_o, T);
 }
 
+static bool qwen4_ane_attn_q_kick(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                  uint32_t il, uint32_t T) {
+    const int h = g_qwen4_ane.q, slot = g_qwen4_ane.aslot[il];
+    return h < 0 || slot < 0 ||
+           (qwen4_ane_stage(h, (uint32_t)slot, 0, m, l->attn_q, g_qwen4_ane.q_gpu) &&
+            ds4_gpu_ane_pack(h, g->mixed, T) && ds4_gpu_ane_eval(h, (uint32_t)slot, h, T));
+}
+
 static bool qwen4_ane_attn_q(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                              uint32_t il, uint32_t T) {
-    return qwen4_ane_split_gemv(g_qwen4_ane.q, g_qwen4_ane.aslot[il], g_qwen4_ane.q_gpu, g->qg, m,
-                                l->attn_q, g->mixed, T);
+    const int h = g_qwen4_ane.q, slot = g_qwen4_ane.aslot[il];
+    const bool kicked = g->ane_kicked;
+    g->ane_kicked = false;
+    if (h < 0 || slot < 0) return qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
+    if (!kicked && !qwen4_ane_attn_q_kick(g, m, l, il, T)) return false;
+    return qwen4_gemv_rows(g_qwen4_ane.part, m, l->attn_q, g->mixed, T, g_qwen4_ane.q_gpu) &&
+           ds4_gpu_ane_unpack(h, (uint32_t)slot, g->qg, T, (uint32_t)l->attn_q->dim[1], g_qwen4_ane.q_gpu,
+                              g_qwen4_ane.part, g_qwen4_ane.q_gpu);
+}
+
+/* Queues the ANE's share of layer il's input projections from g->mixed, for
+ * a pipelined chunk whose mixer runs later. */
+static bool qwen4_ane_kick(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                           uint32_t il, uint32_t T) {
+    if (!qwen4_ane_on(T)) return true;
+    const bool ok = ds4_qwen4_layer_is_linear(il) ? qwen4_ane_gdn_kick(g, m, l, il, T)
+                                                  : qwen4_ane_attn_q_kick(g, m, l, il, T);
+    g->ane_kicked = ok;
+    return ok;
 }
 
 /* The trunk layer's shared expert runs on the ANE beside the routed
@@ -59077,6 +59141,13 @@ static bool qwen4_ane_ready(const ds4_model *m, const ds4_weights *w, uint32_t T
 }
 static bool qwen4_ane_on(uint32_t T) { (void)T; return false; }
 static void qwen4_ane_off(void) {}
+static bool qwen4_ane_pipe(void) { return false; }
+static void qwen4_ane_use_set(int s) { (void)s; }
+static bool qwen4_ane_kick(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                           uint32_t il, uint32_t T) {
+    (void)g; (void)m; (void)l; (void)il; (void)T;
+    return true;
+}
 static bool qwen4_ane_gdn_in(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                              uint32_t il, uint32_t T) {
     (void)g; (void)m; (void)l; (void)il; (void)T;
@@ -59488,6 +59559,78 @@ static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
 }
 
+/* The final mixer and the output projection on the last of T rows. */
+static bool qwen4_graph_logits_last(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, uint32_t T) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * hc_dim * sizeof(float),
+                                               hc_dim * sizeof(float));
+    if (!last) return false;
+    ds4_gpu_tensor *R_save = g->R;
+    g->R = last;
+    const bool ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, 1);
+    g->R = R_save;
+    ds4_gpu_tensor_free(last);
+    return ok && qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
+}
+
+/* The phases of one trunk layer over T rows at pos0: the PLE injection,
+ * the token mixer (GDN or attention) after the attention-side hyper
+ * connection mix, the FFN-side combine and mix, and the routed experts. */
+static bool qwen4_layer_ple(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
+    const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
+    return qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
+           qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
+           ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
+                                         m->map, m->size, l->ple_norm_key->abs_offset,
+                                         l->ple_norm_query->abs_offset, l->ple_norm_conv->abs_offset,
+                                         T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) &&
+           ds4_gpu_qwen4_ple_conv_tensor(g->R, g->ple_gated, g->ple_normed, g->ple_hist, m->map, m->size,
+                                         l->ple_conv->abs_offset, l->ple_conv->type, T, hc_dim, DS4_N_PLE_CONV,
+                                         DS4_N_PLE_NGRAM, g->snap_after_first ? g->snap_ple_hist : NULL, 0u,
+                                         g->snap_after_second ? g->snap2_ple_hist : NULL, 1u);
+}
+
+static bool qwen4_layer_mixer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                              uint32_t il, uint32_t pos0, uint32_t T) {
+    const bool ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
+                                                  : qwen4_graph_attention(g, m, l, il, pos0, T);
+    if (!ok) return false;
+    /* GDN and full attention both project into the same E-wide blk
+     * stream before the hyper-connection residual combine. */
+    if (g->dump_prompt_rows) qwen4_graph_dump_last_attn(g, il, T);
+    return qwen4_graph_apply_steering_attn(g, il, T);
+}
+
+static bool qwen4_layer_ffn_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
+    if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
+        (l->hc_ffn_inject->type == DS4_TENSOR_F16 || l->hc_ffn_inject->type == DS4_TENSOR_BF16)) {
+        if (!ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
+                g->xn, g->inj_alt, g->R, m->map, m->size, l->hc_ffn_norm->abs_offset,
+                l->hc_ffn_inject->abs_offset, l->hc_ffn_inject->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_RMS_EPS))
+            return false;
+        /* hc_u is unused by the single-token fused mixer. Both residual
+         * buffers have the same capacity, including for later prefill. */
+        ds4_gpu_tensor *swap = g->R; g->R = g->hc_u; g->hc_u = swap;
+        swap = g->inj; g->inj = g->inj_alt; g->inj_alt = swap;
+        return qwen4_gemv(g->lo, m, l->hc_ffn_down, g->xn, T) &&
+               ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size,
+                   l->hc_ffn_up->abs_offset, l->hc_ffn_up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+    }
+    return ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0 &&
+           qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
+}
+
+static bool qwen4_layer_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                            uint32_t il, uint32_t pos0, uint32_t T) {
+    qwen4_ane_set_moe_layer((int)il);
+    bool ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
+    qwen4_ane_set_moe_layer(-1);
+    if (ok && g->dump_prompt_rows)
+        metal_graph_debug_dump_tensor("qwen_router", g->router, (uint64_t)T * DS4_N_EXPERT, il, pos0);
+    if (ok && g->dump_prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
+    return ok && qwen4_graph_apply_steering_ffn(g, il, T);
+}
+
 /* Forward T tokens at g->pos..; logits (optional) receive the last token's
  * row, or all T rows with all_rows (T <= n_logit_rows).  T <= cap_tokens;
  * everything is causal by construction because the recurrent kernels walk
@@ -59505,7 +59648,6 @@ static bool qwen4_graph_forward_tokens_once(ds4_qwen4_gpu_graph *g, const ds4_mo
     }
     const uint32_t pos0 = g->pos;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
-    const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
     const double power_t0 = g_qwen4_power_percent < 100u ? now_sec() : 0.0;
     static int timing = -1;
     if (timing < 0) {
@@ -59558,59 +59700,15 @@ static bool qwen4_graph_forward_tokens_once(ds4_qwen4_gpu_graph *g, const ds4_mo
             if (timing) t_ngram = now_sec() - tn;
             if (!ok) break;
         }
-        if (ds4_qwen4_layer_is_ple(il)) {
-            ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
-                 qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
-                 ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
-                                               m->map, m->size, l->ple_norm_key->abs_offset,
-                                               l->ple_norm_query->abs_offset, l->ple_norm_conv->abs_offset,
-                                               T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) &&
-                 ds4_gpu_qwen4_ple_conv_tensor(g->R, g->ple_gated, g->ple_normed, g->ple_hist, m->map, m->size,
-                                               l->ple_conv->abs_offset, l->ple_conv->type, T, hc_dim, DS4_N_PLE_CONV,
-                                               DS4_N_PLE_NGRAM, g->snap_after_first ? g->snap_ple_hist : NULL, 0u,
-                                               g->snap_after_second ? g->snap2_ple_hist : NULL, 1u);
-        }
+        if (ds4_qwen4_layer_is_ple(il)) ok = qwen4_layer_ple(g, m, l, T);
         QWEN4_PROF(0);
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
         QWEN4_PROF(1);
-        if (ok) {
-            ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
-                                               : qwen4_graph_attention(g, m, l, il, pos0, T);
-        }
-        if (ok) {
-            /* GDN and full attention both project into the same E-wide blk
-             * stream before the hyper-connection residual combine. */
-            if (g->dump_prompt_rows) qwen4_graph_dump_last_attn(g, il, T);
-            ok = qwen4_graph_apply_steering_attn(g, il, T);
-        }
+        if (ok) ok = qwen4_layer_mixer(g, m, l, il, pos0, T);
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
-        if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
-            (l->hc_ffn_inject->type == DS4_TENSOR_F16 || l->hc_ffn_inject->type == DS4_TENSOR_BF16)) {
-            if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
-                g->xn, g->inj_alt, g->R, m->map, m->size, l->hc_ffn_norm->abs_offset,
-                l->hc_ffn_inject->abs_offset, l->hc_ffn_inject->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_RMS_EPS);
-            if (ok) {
-                /* hc_u is unused by the single-token fused mixer. Both residual
-                 * buffers have the same capacity, including for later prefill. */
-                ds4_gpu_tensor *swap = g->R; g->R = g->hc_u; g->hc_u = swap;
-                swap = g->inj; g->inj = g->inj_alt; g->inj_alt = swap;
-                ok = qwen4_gemv(g->lo, m, l->hc_ffn_down, g->xn, T) &&
-                    ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size,
-                        l->hc_ffn_up->abs_offset, l->hc_ffn_up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
-            }
-        } else {
-            if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
-            if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-        }
+        if (ok) ok = qwen4_layer_ffn_mix(g, m, l, T);
         QWEN4_PROF(4);
-        qwen4_ane_set_moe_layer((int)il);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
-        qwen4_ane_set_moe_layer(-1);
-        if (ok && g->dump_prompt_rows)
-            metal_graph_debug_dump_tensor("qwen_router", g->router,
-                                           (uint64_t)T * DS4_N_EXPERT, il, pos0);
-        if (ok && g->dump_prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
-        if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
+        if (ok) ok = qwen4_layer_moe(g, m, l, il, pos0, T);
         QWEN4_PROF(5);
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
@@ -59628,18 +59726,7 @@ static bool qwen4_graph_forward_tokens_once(ds4_qwen4_gpu_graph *g, const ds4_mo
         ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
              qwen4_gemv(g->logits, m, w->output, g->mixed, T);
     } else if (ok && logits_out) {
-        /* final mixer on the last token only */
-        ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * hc_dim * sizeof(float),
-                                                   (uint64_t)hc_dim * sizeof(float));
-        ok = last != NULL;
-        if (ok) {
-            ds4_gpu_tensor *R_save = g->R;
-            g->R = last;
-            ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, 1);
-            g->R = R_save;
-            ds4_gpu_tensor_free(last);
-        }
-        if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
+        ok = qwen4_graph_logits_last(g, m, w, T);
     }
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
@@ -59709,6 +59796,165 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     return qwen4_graph_forward_tokens_once(g, m, w, tokens, T, logits_out, all_rows);
 }
 
+
+/* Two prefill chunks in flight with the ANE.  Chunk A runs one layer
+ * phase ahead of chunk B on the GPU's queue:
+ *
+ *   front(A,L)  back(B,L-1)  front(B,L)  back(A,L)  front(A,L+1) ...
+ *
+ * front is the PLE injection and the attention-side mix, ending with the
+ * ANE queued on the layer's input projections; back is the rest of the
+ * layer.  Each queued projection has a whole back phase of the other chunk
+ * to finish in, so the ANE runs beside the GPU's experts instead of the GPU
+ * waiting for it.  A reaches every layer before B, so B's attention and
+ * recurrent state see A's rows as a single forward would.  A keeps the rows
+ * that live across phases (R, inj, mixed, ple_emb) in the pipe_* tensors
+ * and ANE surface set 0; B uses the graph's own tensors and set 1, so they
+ * hold the last chunk afterwards, as after a single forward. */
+typedef struct {
+    ds4_gpu_tensor *R, *inj, *mixed, *ple_emb;
+    const int *tokens;
+    uint32_t pos0, T;
+    int set;
+    bool kicked;
+} qwen4_pipe_chunk;
+
+static bool qwen4_pipe_alloc(ds4_qwen4_gpu_graph *g) {
+    const uint64_t T = g->cap_tokens, E = DS4_N_EMBD, hc = DS4_N_HC;
+    if (!g->pipe_R) g->pipe_R = qwen4_graph_alloc_f32(T * E * hc);
+    if (!g->pipe_inj) g->pipe_inj = qwen4_graph_alloc_f32(T * hc * DS4_QWEN4_HC_CHUNKS * hc);
+    if (!g->pipe_mixed) g->pipe_mixed = qwen4_graph_alloc_f32(T * E);
+    if (!g->pipe_ple_emb) g->pipe_ple_emb = qwen4_graph_alloc_f32(T * E);
+    return g->pipe_R && g->pipe_inj && g->pipe_mixed && g->pipe_ple_emb;
+}
+
+static void qwen4_pipe_enter(ds4_qwen4_gpu_graph *g, const qwen4_pipe_chunk *c) {
+    g->R = c->R;
+    g->inj = c->inj;
+    g->mixed = c->mixed;
+    g->ple_emb = c->ple_emb;
+    g->pos = c->pos0;
+    g->ane_kicked = c->kicked;
+    qwen4_ane_use_set(c->set);
+}
+
+static bool qwen4_pipe_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                             qwen4_pipe_chunk *c, uint32_t il) {
+    const ds4_layer_weights *l = &w->layer[il];
+    qwen4_pipe_enter(g, c);
+    const bool ok = (!ds4_qwen4_layer_is_ple(il) || qwen4_layer_ple(g, m, l, c->T)) &&
+        qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, c->T) &&
+        qwen4_ane_kick(g, m, l, il, c->T);
+    c->kicked = g->ane_kicked;
+    return ok;
+}
+
+static bool qwen4_pipe_back(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                            qwen4_pipe_chunk *c, uint32_t il) {
+    const ds4_layer_weights *l = &w->layer[il];
+    qwen4_pipe_enter(g, c);
+    const bool ok = qwen4_layer_mixer(g, m, l, il, c->pos0, c->T) &&
+                    qwen4_layer_ffn_mix(g, m, l, c->T) &&
+                    qwen4_layer_moe(g, m, l, il, c->pos0, c->T);
+    c->kicked = g->ane_kicked;
+    return ok;
+}
+
+static bool qwen4_graph_forward_pair_once(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                          const int *tokens, uint32_t TA, uint32_t TB, float *logits_out) {
+    const uint32_t pos0 = g->pos;
+    if (TA == 0 || TB == 0 || TA > g->cap_tokens || TB > g->cap_tokens || pos0 + TA + TB > g->ctx_cap) return false;
+    for (uint32_t t = 0; t < TA + TB; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: Qwen3.8 token id %d is outside the vocabulary\n", tokens[t]);
+            return false;
+        }
+    }
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    ds4_gpu_tensor *const own[4] = { g->R, g->inj, g->mixed, g->ple_emb };
+    qwen4_pipe_chunk c[2] = {
+        { g->pipe_R, g->pipe_inj, g->pipe_mixed, g->pipe_ple_emb, tokens, pos0, TA, 0, false },
+        { g->R, g->inj, g->mixed, g->ple_emb, tokens + TA, pos0 + TA, TB, 1, false },
+    };
+    /* the n-gram rows come from disk: read them while the first layers run */
+    const bool ngram_late = !getenv("DS4_QWEN4_NGRAM_FIRST") && DS4_N_PLE_LAYER > 0 && DS4_N_PLE_LAYER < n_trunk;
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; i++) {
+        qwen4_pipe_enter(g, &c[i]);
+        ok = qwen4_graph_stage_rows(g, m, w, c[i].tokens, c[i].T) &&
+             (ngram_late || qwen4_graph_stage_ngrams(g, m, c[i].tokens, c[i].T));
+    }
+    if (ok) ok = glm_graph_begin_commands_if_needed();
+    for (uint32_t il = 0; il <= n_trunk && ok; il++) {
+        if (ngram_late && il == DS4_N_PLE_LAYER) {
+            ok = ds4_gpu_flush_commands() != 0;
+            for (int i = 0; i < 2 && ok; i++) {
+                qwen4_pipe_enter(g, &c[i]);
+                ok = qwen4_graph_stage_ngrams(g, m, c[i].tokens, c[i].T);
+            }
+            if (!ok) break;
+        }
+        if (il < n_trunk) ok = qwen4_pipe_front(g, m, w, &c[0], il);
+        if (ok && il > 0) ok = qwen4_pipe_back(g, m, w, &c[1], il - 1u);
+        if (ok && il < n_trunk) ok = qwen4_pipe_front(g, m, w, &c[1], il);
+        if (ok && il < n_trunk) ok = qwen4_pipe_back(g, m, w, &c[0], il);
+        if (ok && il == 1u) ok = ds4_gpu_flush_commands() != 0;
+    }
+    qwen4_pipe_enter(g, &c[1]);
+    if (ok && logits_out) ok = qwen4_graph_logits_last(g, m, w, TB);
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok && logits_out) ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    g->R = own[0];
+    g->inj = own[1];
+    g->mixed = own[2];
+    g->ple_emb = own[3];
+    g->ane_kicked = false;
+    qwen4_ane_use_set(0);
+    g->pos = ok ? pos0 + TA + TB : pos0;
+    return ok;
+}
+
+/* True if prefill chunks of T rows run in pairs. */
+static bool qwen4_graph_pairs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, uint32_t T) {
+    return g && qwen4_ane_ready(m, w, T) && qwen4_ane_on(T) && qwen4_ane_pipe() &&
+           !g->snap_after_first && !g->snap_after_second;
+}
+
+/* The chunk to pair with the next chunk of *T out of n remaining tokens, or
+ * 0 to run it alone.  A last chunk that would run alone is halved when both
+ * halves are big enough for the ANE: with the pipe's splits a lone chunk
+ * would leave the GPU waiting for the ANE. */
+static uint32_t qwen4_graph_pair_tail(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                      uint32_t n, uint32_t *T) {
+    if (n > *T) {
+        if (!qwen4_graph_pairs(g, m, w, *T)) return 0;
+        return n - *T < g->cap_tokens ? n - *T : g->cap_tokens;
+    }
+    const uint32_t half = n / 2u;
+    if (!qwen4_graph_pairs(g, m, w, n - half) || !qwen4_ane_on(half)) return 0;
+    *T = n - half;
+    return half;
+}
+
+/* TA then TB tokens, as two qwen4_graph_forward_tokens calls would run
+ * them; logits_out receives the last row.  Like a single chunk the pair
+ * starts from a copy of the recurrent state and the GPU reruns both chunks
+ * alone if an ANE evaluation fails. */
+static bool qwen4_graph_forward_pair(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                     const int *tokens, uint32_t TA, uint32_t TB, float *logits_out) {
+    if (!qwen4_graph_pairs(g, m, w, TA) || !qwen4_pipe_alloc(g) ||
+        !qwen4_graph_ensure_state_set(g, g->ane_lin_state, g->ane_lin_hist, &g->ane_ple_hist) ||
+        !qwen4_graph_state_copy_ane(g, true)) {
+        return qwen4_graph_forward_tokens(g, m, w, tokens, TA, NULL, false) &&
+               qwen4_graph_forward_tokens(g, m, w, tokens + TA, TB, logits_out, false);
+    }
+    const bool ok = qwen4_graph_forward_pair_once(g, m, w, tokens, TA, TB, logits_out);
+    if (qwen4_ane_settle()) return ok;
+    fprintf(stderr, "ds4: rerunning the prefill chunks at %u (%u + %u tokens) on the GPU\n", g->ane_pos, TA, TB);
+    return qwen4_graph_state_copy_ane(g, false) &&
+           qwen4_graph_forward_tokens_once(g, m, w, tokens, TA, NULL, false) &&
+           qwen4_graph_forward_tokens_once(g, m, w, tokens + TA, TB, logits_out, false);
+}
 
 static bool qwen4_graph_forward_token(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                       int token, float *logits_out) {
@@ -60180,8 +60426,15 @@ static int generate_qwen4_metal_argmax(
     for (int i = 0; i < prompt->len && ok;) {
         uint32_t chunk = (uint32_t)(prompt->len - i);
         if (chunk > g->cap_tokens) chunk = g->cap_tokens;
-        ok = qwen4_graph_forward_tokens(g, model, weights, prompt->v + i, chunk,
-                                        i + (int)chunk == prompt->len ? logits : NULL, false);
+        const uint32_t chunk2 = qwen4_graph_pair_tail(g, model, weights, (uint32_t)(prompt->len - i), &chunk);
+        if (chunk2) {
+            ok = qwen4_graph_forward_pair(g, model, weights, prompt->v + i, chunk, chunk2,
+                                          i + (int)(chunk + chunk2) == prompt->len ? logits : NULL);
+            chunk += chunk2;
+        } else {
+            ok = qwen4_graph_forward_tokens(g, model, weights, prompt->v + i, chunk,
+                                            i + (int)chunk == prompt->len ? logits : NULL, false);
+        }
         i += (int)chunk;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
     }
@@ -76271,12 +76524,20 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             }
             uint32_t chunk = (uint32_t)(prompt->len - i);
             if (chunk > s->qwen4_graph.cap_tokens) chunk = s->qwen4_graph.cap_tokens;
+            const uint32_t chunk2 = qwen4_graph_pair_tail(&s->qwen4_graph, &e->model, &e->weights,
+                                                          (uint32_t)(prompt->len - i), &chunk);
             /* Progress callbacks may persist this frontier, and cancellation
              * may leave it as the live session. Every completed chunk needs
-             * its own logits as well as recurrent/KV state. */
+             * its own logits as well as recurrent/KV state; a pair of chunks
+             * counts as one. */
             s->checkpoint_valid = false;
-            if (!qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
-                                            prompt->v + i, chunk, s->logits, false)) {
+            const bool fok = chunk2 ?
+                qwen4_graph_forward_pair(&s->qwen4_graph, &e->model, &e->weights,
+                                         prompt->v + i, chunk, chunk2, s->logits) :
+                qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
+                                           prompt->v + i, chunk, s->logits, false);
+            chunk += chunk2;
+            if (!fok) {
                 snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
                 s->checkpoint_valid = false;
                 prefill_rc = 1;

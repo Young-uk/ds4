@@ -50941,14 +50941,17 @@ typedef struct {
     NSArray *proc_in[8], *proc_out[8], *proc_names[8];
     int kind;               /* 0: y = x W^T, int8 W; 1: y = down(silu(x G^T) * x U^T), fp16 */
     uint32_t K, N, R, F, n_slots, n_w;
-    ds4_ane_surface x, y;
-    ds4_ane_surface w[3];   /* n_w weight surfaces, staged per slot by the GPU */
-    id<MTLBuffer> scales;   /* n_slots * N floats */
-    /* The evaluations signal the program's own event, in order, so the GPU's
-     * wait for one cannot pass on the signal of another program or of the
-     * GPU itself. */
-    id<MTLSharedEvent> done_ev;
-    uint64_t done_seq;      /* last value queued on done_ev */
+    /* Two sets of surfaces when two prefill chunks are in flight: chunk i
+     * stages, packs and reads set i, so the ANE can run one chunk's
+     * evaluation while the GPU still reads the other's result. */
+    ds4_ane_surface x[2], y[2];
+    ds4_ane_surface w[2][3];   /* n_w weight surfaces, staged per slot by the GPU */
+    id<MTLBuffer> scales;      /* n_slots * N floats */
+    /* Each set's evaluations signal their own event, in order, so the GPU's
+     * wait for one cannot pass on the signal of another program, of the
+     * other chunk, or of the GPU itself. */
+    id<MTLSharedEvent> done_ev[2];
+    uint64_t done_seq[2];      /* last value queued on done_ev */
 } ds4_ane_prog;
 
 #define DS4_ANE_MAX_PROGS 16
@@ -50966,6 +50969,7 @@ static struct {
     Class<DS4AneEvents> events_class, signal_class, wait_class;
     ds4_ane_prog prog[DS4_ANE_MAX_PROGS];
     int n_prog;
+    int n_sets, cur;   /* surface sets per program (1 or 2) and the one in use */
     id<MTLSharedEvent> event;          /* the GPU's input-ready signals only */
     uint64_t seq, last_ready;          /* seq also numbers the evaluations */
     _Atomic int failed;
@@ -51107,6 +51111,22 @@ static void ds4_ane_set_buckets(ds4_ane_prog *p, uint32_t R) {
     p->proc_rows[p->n_proc++] = R;
 }
 
+static int ds4_ane_n_sets(void) {
+    return g_ane.n_sets == 2 ? 2 : 1;
+}
+
+int ds4_gpu_ane_set_count(int n) {
+    if (g_ane.n_prog || (n != 1 && n != 2)) return 0;
+    g_ane.n_sets = n;
+    return 1;
+}
+
+int ds4_gpu_ane_use_set(int s) {
+    if (s < 0 || s >= ds4_ane_n_sets()) return 0;
+    g_ane.cur = s;
+    return 1;
+}
+
 /* A projection K -> N over R token rows with int8 weight rows, whose row
  * scales (n_slots sets of N) the unpack applies. */
 int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots) {
@@ -51115,15 +51135,14 @@ int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots) {
     @autoreleasepool {
         ds4_ane_prog *p = &g_ane.prog[g_ane.n_prog];
         p->K = K; p->N = N; p->R = R; p->n_slots = n_slots;
-        if (!(p->done_ev = [g_device newSharedEvent]) ||
-            !ds4_ane_make_surface(&p->x, R, K, 2) || !ds4_ane_make_surface(&p->y, R, N, 2)) {
-            fprintf(stderr, "ds4: ANE: surface allocation failed\n");
-            return -1;
-        }
         p->n_w = 1;
-        if (!ds4_ane_make_surface(&p->w[0], N, K, 1)) {
-            fprintf(stderr, "ds4: ANE: weight surface allocation failed\n");
-            return -1;
+        for (int s = 0; s < ds4_ane_n_sets(); s++) {
+            if (!(p->done_ev[s] = [g_device newSharedEvent]) ||
+                !ds4_ane_make_surface(&p->x[s], R, K, 2) || !ds4_ane_make_surface(&p->y[s], R, N, 2) ||
+                !ds4_ane_make_surface(&p->w[s][0], N, K, 1)) {
+                fprintf(stderr, "ds4: ANE: surface allocation failed\n");
+                return -1;
+            }
         }
         p->scales = [g_device newBufferWithLength:(NSUInteger)n_slots * N * sizeof(float)
                                           options:MTLResourceStorageModeShared];
@@ -51135,16 +51154,16 @@ int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots) {
         for (uint32_t b = 0; b < p->n_proc; b++) {
             const uint32_t r = p->proc_rows[b];
             [mil appendFormat:@"    func r%u<ios18>(%@ x, %@ w) {\n", r,
-                ds4_ane_buffer_type(&p->x, 2, r, K), ds4_ane_buffer_type(&p->w[0], 1, N, K)];
+                ds4_ane_buffer_type(&p->x[0], 2, r, K), ds4_ane_buffer_type(&p->w[0][0], 1, N, K)];
             [mil appendFormat:@"        tensor<fp16, %@> x_t = tensor_buffer_to_tensor<ios17>(input = x);\n", ds4_ane_dims(r, K)];
             [mil appendFormat:@"        tensor<int8, %@> w_t = tensor_buffer_to_tensor<ios17>(input = w);\n", ds4_ane_dims(N, K)];
             /* int8 / 128: the row scales carry the factor back */
             [mil appendFormat:@"        tensor<fp16, %@> w_d = dequantize(input = w_t, scale = fp16(0x1p-7));\n", ds4_ane_dims(N, K)];
             [mil appendFormat:@"        tensor<fp16, %@> yt = matmul(transpose_x = bool(false), transpose_y = bool(true), x = x_t, y = w_d);\n",
                 ds4_ane_dims(r, N)];
-            const uint64_t yst = p->y.stride / 2, yplane = (uint64_t)r * yst;
+            const uint64_t yst = p->y[0].stride / 2, yplane = (uint64_t)r * yst;
             [mil appendFormat:@"        %@ y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>([%llu, %llu, %llu, 1]));\n",
-                ds4_ane_buffer_type(&p->y, 2, r, N), (unsigned long long)yplane, (unsigned long long)yplane, (unsigned long long)yst];
+                ds4_ane_buffer_type(&p->y[0], 2, r, N), (unsigned long long)yplane, (unsigned long long)yplane, (unsigned long long)yst];
             [mil appendString:@"    } -> (y);\n"];
         }
         [mil appendString:@"}\n"];
@@ -51163,10 +51182,12 @@ int ds4_gpu_ane_create_ffn(uint32_t K, uint32_t F, uint32_t R, uint32_t n_slots)
     @autoreleasepool {
         ds4_ane_prog *p = &g_ane.prog[g_ane.n_prog];
         p->kind = 1; p->K = K; p->N = K; p->F = F; p->R = R; p->n_slots = n_slots; p->n_w = 3;
-        if (!(p->done_ev = [g_device newSharedEvent]) ||
-            !ds4_ane_make_surface(&p->x, R, K, 2) || !ds4_ane_make_surface(&p->y, R, K, 2)) return -1;
-        if (!ds4_ane_make_surface(&p->w[0], F, K, 2) || !ds4_ane_make_surface(&p->w[1], F, K, 2) ||
-            !ds4_ane_make_surface(&p->w[2], K, F, 2)) return -1;
+        for (int s = 0; s < ds4_ane_n_sets(); s++) {
+            if (!(p->done_ev[s] = [g_device newSharedEvent]) ||
+                !ds4_ane_make_surface(&p->x[s], R, K, 2) || !ds4_ane_make_surface(&p->y[s], R, K, 2) ||
+                !ds4_ane_make_surface(&p->w[s][0], F, K, 2) || !ds4_ane_make_surface(&p->w[s][1], F, K, 2) ||
+                !ds4_ane_make_surface(&p->w[s][2], K, F, 2)) return -1;
+        }
         p->scales = [g_device newBufferWithLength:(NSUInteger)n_slots * K * sizeof(float) options:MTLResourceStorageModeShared];
         float *sc = [p->scales contents];
         for (uint64_t i = 0; i < (uint64_t)n_slots * K; i++) sc[i] = 1.0f;
@@ -51175,8 +51196,8 @@ int ds4_gpu_ane_create_ffn(uint32_t K, uint32_t F, uint32_t R, uint32_t n_slots)
         for (uint32_t b = 0; b < p->n_proc; b++) {
             const uint32_t r = p->proc_rows[b];
             [mil appendFormat:@"    func r%u<ios18>(%@ x, %@ wg, %@ wu, %@ wd) {\n", r,
-                ds4_ane_buffer_type(&p->x, 2, r, K), ds4_ane_buffer_type(&p->w[0], 2, F, K),
-                ds4_ane_buffer_type(&p->w[1], 2, F, K), ds4_ane_buffer_type(&p->w[2], 2, K, F)];
+                ds4_ane_buffer_type(&p->x[0], 2, r, K), ds4_ane_buffer_type(&p->w[0][0], 2, F, K),
+                ds4_ane_buffer_type(&p->w[0][1], 2, F, K), ds4_ane_buffer_type(&p->w[0][2], 2, K, F)];
             [mil appendFormat:@"        tensor<fp16, %@> x_t = tensor_buffer_to_tensor<ios17>(input = x);\n", ds4_ane_dims(r, K)];
             [mil appendFormat:@"        tensor<fp16, %@> wg_t = tensor_buffer_to_tensor<ios17>(input = wg);\n", ds4_ane_dims(F, K)];
             [mil appendFormat:@"        tensor<fp16, %@> wu_t = tensor_buffer_to_tensor<ios17>(input = wu);\n", ds4_ane_dims(F, K)];
@@ -51189,9 +51210,9 @@ int ds4_gpu_ane_create_ffn(uint32_t K, uint32_t F, uint32_t R, uint32_t n_slots)
             [mil appendFormat:@"        tensor<fp16, %@> sg = mul(x = gh, y = tp);\n", ds4_ane_dims(r, F)];
             [mil appendFormat:@"        tensor<fp16, %@> hh = mul(x = sg, y = u);\n", ds4_ane_dims(r, F)];
             [mil appendFormat:@"        tensor<fp16, %@> yt = matmul(transpose_x = bool(false), transpose_y = bool(true), x = hh, y = wd_t);\n", ds4_ane_dims(r, K)];
-            const uint64_t yst = p->y.stride / 2, yplane = (uint64_t)r * yst;
+            const uint64_t yst = p->y[0].stride / 2, yplane = (uint64_t)r * yst;
             [mil appendFormat:@"        %@ y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>([%llu, %llu, %llu, 1]));\n",
-                ds4_ane_buffer_type(&p->y, 2, r, K), (unsigned long long)yplane, (unsigned long long)yplane, (unsigned long long)yst];
+                ds4_ane_buffer_type(&p->y[0], 2, r, K), (unsigned long long)yplane, (unsigned long long)yplane, (unsigned long long)yst];
             [mil appendString:@"    } -> (y);\n"];
         }
         [mil appendString:@"}\n"];
@@ -51292,7 +51313,8 @@ int ds4_gpu_ane_stage(int h, uint32_t slot, uint32_t j, const ds4_gpu_ane_weight
     if (slot >= p->n_slots || j >= p->n_w) return 0;
     const uint32_t K = p->kind == 1 && j == 2 ? p->F : p->K;
     const uint32_t rows = p->kind == 1 ? (j == 2 ? p->K : p->F) : p->N;
-    return ds4_ane_encode_stage(g_batch_cb, p->kind == 0 ? 0 : 1, wt, K, rows, p->w[j].buffer, p->w[j].stride,
+    const ds4_ane_surface *ws = &p->w[g_ane.cur][j];
+    return ds4_ane_encode_stage(g_batch_cb, p->kind == 0 ? 0 : 1, wt, K, rows, ws->buffer, ws->stride,
                                 p->scales, (NSUInteger)slot * p->N * sizeof(float));
 }
 
@@ -51323,9 +51345,10 @@ int ds4_gpu_ane_pack(int h, const ds4_gpu_tensor *x, uint32_t T) {
     ds4_ane_prog *p = &g_ane.prog[h];
     if (T == 0 || T > p->R) return 0;
     @autoreleasepool {
-        __unsafe_unretained id<MTLBuffer> bufs[4] = { ds4_gpu_tensor_buffer(x), p->x.buffer, nil, nil };
+        const ds4_ane_surface *xs = &p->x[g_ane.cur];
+        __unsafe_unretained id<MTLBuffer> bufs[4] = { ds4_gpu_tensor_buffer(x), xs->buffer, nil, nil };
         const NSUInteger offs[4] = { ds4_gpu_tensor_offset(x), 0, 0, 0 };
-        const uint32_t args[8] = { p->K, T, p->x.stride / 2u, 0, 0, 0, 0, 0 };
+        const uint32_t args[8] = { p->K, T, xs->stride / 2u, 0, 0, 0, 0, 0 };
         if (!ds4_ane_dispatch("kernel_ane_pack_f16", bufs, offs, args, p->K, T)) return 0;
         ds4_gpu_close_batch_encoder();
         g_ane.last_ready = ++g_ane.seq;
@@ -51357,7 +51380,8 @@ static void ds4_ane_fail(const char *why) {
         fprintf(stderr, "ds4: ANE evaluation %s; the GPU runs the prefill alone from now on\n", why);
     for (int h = 0; h < g_ane.n_prog; h++) {
         ds4_ane_prog *p = &g_ane.prog[h];
-        if (p->done_ev && p->done_ev.signaledValue < p->done_seq) p->done_ev.signaledValue = p->done_seq;
+        for (int s = 0; s < ds4_ane_n_sets(); s++)
+            if (p->done_ev[s] && p->done_ev[s].signaledValue < p->done_seq[s]) p->done_ev[s].signaledValue = p->done_seq[s];
     }
 }
 
@@ -51398,20 +51422,21 @@ int ds4_gpu_ane_eval(int h, uint32_t slot, int xh, uint32_t T) {
         uint32_t b = 0;
         while (b + 1 < p->n_proc && p->proc_rows[b] < T) b++;
         if (T == 0 || p->proc_rows[b] < T) return 0;
-        const uint64_t ready = g_ane.last_ready, done = ++g_ane.seq, value = p->done_seq + 1u;
-        id<MTLSharedEvent> done_ev = p->done_ev;
+        const int set = g_ane.cur;
+        const uint64_t ready = g_ane.last_ready, done = ++g_ane.seq, value = p->done_seq[set] + 1u;
+        id<MTLSharedEvent> done_ev = p->done_ev[set];
         id ev_signal = [g_ane.signal_class signalEventWithValue:value symbolIndex:0 eventType:0 sharedEvent:done_ev];
         id ev_wait = [g_ane.wait_class waitEventWithValue:ready sharedEvent:g_ane.event eventType:0];
         id events = [g_ane.events_class sharedEventsWithSignalEvents:@[ ev_signal ] waitEvents:@[ ev_wait ]];
         NSMutableArray *ins = [NSMutableArray array];
         for (NSString *nm in p->proc_names[b]) {
-            if ([nm isEqualToString:@"x"]) [ins addObject:px->x.object];
-            else if ([nm isEqualToString:@"w"]) [ins addObject:p->w[0].object];
-            else if ([nm isEqualToString:@"wg"]) [ins addObject:p->w[0].object];
-            else if ([nm isEqualToString:@"wu"]) [ins addObject:p->w[1].object];
-            else [ins addObject:p->w[2].object];
+            if ([nm isEqualToString:@"x"]) [ins addObject:px->x[set].object];
+            else if ([nm isEqualToString:@"w"]) [ins addObject:p->w[set][0].object];
+            else if ([nm isEqualToString:@"wg"]) [ins addObject:p->w[set][0].object];
+            else if ([nm isEqualToString:@"wu"]) [ins addObject:p->w[set][1].object];
+            else [ins addObject:p->w[set][2].object];
         }
-        id req = [g_ane.request_class requestWithInputs:ins inputIndices:p->proc_in[b] outputs:@[ p->y.object ]
+        id req = [g_ane.request_class requestWithInputs:ins inputIndices:p->proc_in[b] outputs:@[ p->y[set].object ]
                                           outputIndices:p->proc_out[b] weightsBuffer:nil perfStats:nil
                                          procedureIndex:p->proc_id[b] sharedEvents:events transactionHandle:nil];
         if (!events || !req) return 0;
@@ -51430,8 +51455,8 @@ int ds4_gpu_ane_eval(int h, uint32_t slot, int xh, uint32_t T) {
                 return;
             }
             if (fault == 2) {
-                uint16_t *y = pf->y.buffer.contents;
-                for (uint64_t i = 0; i < pf->y.buffer.length / 2u; i++) y[i] = 0x7e00u;
+                uint16_t *y = pf->y[set].buffer.contents;
+                for (uint64_t i = 0; i < pf->y[set].buffer.length / 2u; i++) y[i] = 0x7e00u;
                 ds4_ane_finish(done);
                 if (done_ev.signaledValue < value) done_ev.signaledValue = value;
                 return;
@@ -51441,7 +51466,7 @@ int ds4_gpu_ane_eval(int h, uint32_t slot, int xh, uint32_t T) {
             });
         }];
         g_ane.evals++;
-        p->done_seq = value;
+        p->done_seq[set] = value;
         if (fault == 0) {
             NSError *err = nil;
             if (![g_ane.client evaluateWithModel:p->model options:@{} request:req qos:21 error:&err] &&
@@ -51463,12 +51488,13 @@ int ds4_gpu_ane_unpack(int h, uint32_t slot, ds4_gpu_tensor *out, uint32_t T, ui
     if (slot >= p->n_slots || col0 + p->N > ld) return 0;
     @autoreleasepool {
         ds4_gpu_close_batch_encoder();
-        [g_batch_cb encodeWaitForEvent:p->done_ev value:p->done_seq];
-        __unsafe_unretained id<MTLBuffer> bufs[4] = { p->y.buffer, ds4_gpu_tensor_buffer(out), p->scales,
+        const ds4_ane_surface *ys = &p->y[g_ane.cur];
+        [g_batch_cb encodeWaitForEvent:p->done_ev[g_ane.cur] value:p->done_seq[g_ane.cur]];
+        __unsafe_unretained id<MTLBuffer> bufs[4] = { ys->buffer, ds4_gpu_tensor_buffer(out), p->scales,
                                   gpu_part ? ds4_gpu_tensor_buffer(gpu_part) : nil };
         const NSUInteger offs[4] = { 0, ds4_gpu_tensor_offset(out), (NSUInteger)slot * p->N * sizeof(float),
                                      gpu_part ? ds4_gpu_tensor_offset(gpu_part) : 0 };
-        const uint32_t args[8] = { p->N, T, p->y.stride / 2u, ld, col0, gpu_part ? gpu_cols : 0u, 0, 0 };
+        const uint32_t args[8] = { p->N, T, ys->stride / 2u, ld, col0, gpu_part ? gpu_cols : 0u, 0, 0 };
         const uint32_t width = gpu_part ? ld : p->N;
         return ds4_ane_dispatch(gpu_part ? "kernel_ane_join_f32" : "kernel_ane_unpack_f32", bufs, offs, args, width, T);
     }

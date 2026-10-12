@@ -10,7 +10,8 @@
 /* The Neural Engine prefill path of ds4_metal.m against a CPU reference:
  * int8 projections staged by the GPU from Q8_0 rows (two layers, a full and
  * a partial row bucket), a split projection joined with GPU columns, the
- * SwiGLU FFN with fp16 weights, and a fault that must surface in settle. */
+ * SwiGLU FFN with fp16 weights, two chunks in flight on the two surface
+ * sets, and a fault that must surface in settle. */
 
 enum { K = 256, N = 512, F = 128, R = 1024, SLOTS = 2, GPU_COLS = 192, Q8_BLOCK = 34 };
 static uint32_t rng = 7;
@@ -87,10 +88,10 @@ int main(void) {
         fill_q8(m + base + 2u * ffn, K, F, ws + 2u * (uint64_t)F * K);  /* down [K][F] */
     }
     for (uint64_t i = 0; i < (uint64_t)R * K; i++) x[i] = random_unit();
-    /* seven good evaluations, then a non-finite one */
-    setenv("DS4_ANE_TEST_FAIL", "8:nan", 1);
+    /* nine good evaluations, then a non-finite one */
+    setenv("DS4_ANE_TEST_FAIL", "10:nan", 1);
 
-    int ok = ds4_gpu_init() && ds4_gpu_set_model_map(map, bytes);
+    int ok = ds4_gpu_init() && ds4_gpu_set_model_map(map, bytes) && ds4_gpu_ane_set_count(2);
     const int hp = ok ? ds4_gpu_ane_create(K, N, R, SLOTS) : -1;
     const int hj = ok ? ds4_gpu_ane_create(K, N - GPU_COLS, R, 1) : -1;
     const int hf = ok ? ds4_gpu_ane_create_ffn(K, F, R, SLOTS) : -1;
@@ -170,7 +171,31 @@ int main(void) {
         ok = ok && close_enough(what, y, ref, (uint64_t)T * K);
     }
 
-    /* the eighth evaluation returns non-finite rows: settle reports it */
+    /* two chunks in flight: set 1's input is signalled ready after set 0's
+     * evaluation is queued, and set 0's result must still be waited for */
+    if (ok) {
+        const uint32_t T[2] = { R, 600 };
+        ds4_gpu_tensor *out1 = ds4_gpu_tensor_alloc((uint64_t)R * N * sizeof(float));
+        ok = out1 != NULL && ds4_gpu_begin_commands();
+        for (int c = 0; c < 2 && ok; c++) {
+            const ds4_gpu_ane_weight w = weight(map, bytes, (uint32_t)c * proj, K, 0);
+            ok = ds4_gpu_ane_use_set(c) && ds4_gpu_ane_stage(hp, (uint32_t)c, 0, &w) &&
+                 ds4_gpu_ane_pack(hp, xt, T[c]) && ds4_gpu_ane_eval(hp, (uint32_t)c, hp, T[c]);
+        }
+        for (int c = 0; c < 2 && ok; c++)
+            ok = ds4_gpu_ane_use_set(c) && ds4_gpu_ane_unpack(hp, (uint32_t)c, c ? out1 : out, T[c], N, 0, NULL, 0);
+        ok = ds4_gpu_end_commands() && ok && ds4_gpu_ane_settle() && ds4_gpu_ane_use_set(0);
+        for (int c = 0; c < 2 && ok; c++) {
+            ok = ds4_gpu_tensor_read(c ? out1 : out, 0, y, (uint64_t)T[c] * N * sizeof(float));
+            matmul(ref, x, wp + (uint64_t)c * N * K, T[c], K, N);
+            char what[64];
+            snprintf(what, sizeof what, "ANE chunk in flight on surface set %d, %u rows", c, T[c]);
+            ok = ok && close_enough(what, y, ref, (uint64_t)T[c] * N);
+        }
+        ds4_gpu_tensor_free(out1);
+    }
+
+    /* the tenth evaluation returns non-finite rows: settle reports it */
     if (ok) {
         const ds4_gpu_ane_weight w = weight(map, bytes, 0, K, 0);
         ok = ds4_gpu_begin_commands() && ds4_gpu_ane_stage(hp, 0, 0, &w) && ds4_gpu_ane_pack(hp, xt, 512) &&

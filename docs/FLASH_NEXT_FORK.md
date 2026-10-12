@@ -121,6 +121,15 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   IQ3_XXS; the NLL moves inside the noise. The split is tuned for the M1
   Max; on another chip `DS4_ANE_QKV`, `DS4_ANE_ATTNQ` and `DS4_ANE_SSMOUT`
   set how many leading columns stay on the GPU.
+- **Prefill chunks in pairs** with the Neural Engine. Two chunks go through
+  the layers together, the second one layer phase behind the first: while
+  the GPU runs the experts of one chunk, the Neural Engine computes the
+  next layer's input projections of the other, so it can take nearly all
+  of qkv, attn_q and the GDN gate without the GPU waiting for it. A last
+  chunk that would run alone is halved into a pair. Prefill goes from 441
+  to 467 tok/s at 8K and from 416 to 442 at 32K (Q2_0, 373 and 359 on the
+  GPU alone), for 0.4 GB more memory: a second set of surfaces and the
+  first chunk's rows. `DS4_ANE_PIPE=0` goes back to one chunk at a time.
 
 Each change is a separate commit with a test.
 

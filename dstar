@@ -60,7 +60,7 @@ usage: dstar <command> [options]
       --no-mtp           plain decoding without the speculative MTP block
       --no-vision        do not load the vision encoder
       --ane              run part of the prompt processing on the Neural
-                         Engine: about 15% faster prefill, 0.4 GB more memory
+                         Engine: about 25% faster prefill, 0.8 GB more memory
       --power N          keep the GPU busy N% of the time, 1..100: a cooler
                          and quieter Mac for a proportionally slower model
       NAME or FILE       serve another model instead: a GGUF path or a word
@@ -211,7 +211,8 @@ parse_power() {
     echo "$1"
 }
 
-# --ane adds the Neural Engine's surfaces and the chunk's state copy.
+# --ane adds the Neural Engine's two sets of surfaces, the second chunk's
+# rows and the state copy.
 ANE_GIB=0
 need_mib() { awk -v c="$1" -v b="$BASE_GIB" -v a="$ANE_GIB" 'BEGIN { printf "%d", (b + a + c * 3.315e-5 + 2) * 1024 }'; }
 
@@ -323,7 +324,7 @@ cmd_serve() {
             --lan) HOST=0.0.0.0 ;;
             --no-mtp) mtp=0 ;;
             --no-vision) vision=0 ;;
-            --ane) ane=1; ANE_GIB=0.4 ;;
+            --ane) ane=1; ANE_GIB=0.8 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
             --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;

@@ -3394,6 +3394,11 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
 /* Neural Engine projections for the prefill (ds4_metal.m, Apple only). */
+/* Surface sets per program, 1 or 2, before the first program is created;
+ * with 2, ds4_gpu_ane_use_set picks the one the next stage, pack, eval and
+ * unpack calls use. */
+int ds4_gpu_ane_set_count(int n);
+int ds4_gpu_ane_use_set(int s);
 int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots);
 /* Rows [r0, r0 + rows) of a model weight: `type` rows of row_bytes at
  * `offset` of the mapped model. */
