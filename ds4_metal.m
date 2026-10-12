@@ -50306,6 +50306,8 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, false);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_DOWN_NT");
     const bool reg = qwen4_moe_mm_reg(weight_type, nt);
+    /* the register tiles take 64 down rows, the staged ones 32 */
+    const uint32_t rows_tg = reg ? 64u : 32u;
     const int k_nt1 = reg ? QWEN4_K_MOE_MM_DOWN_REG_NT1 : QWEN4_K_MOE_MM_DOWN_NT1;
     const int k_nt2 = reg ? QWEN4_K_MOE_MM_DOWN_REG_NT2 : QWEN4_K_MOE_MM_DOWN_NT2;
     const int k_nt4 = reg ? QWEN4_K_MOE_MM_DOWN_REG : QWEN4_K_MOE_MM_DOWN;
@@ -50371,10 +50373,10 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
                               MTLSizeMake(128, 1, 1), 8192u);
     }
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
-                          qwen4_moe_mm_grid((out_dim + 31u) / 32u, n_expert, tiles, args.expert_major),
+                          qwen4_moe_mm_grid((out_dim + rows_tg - 1u) / rows_tg, n_expert, tiles, args.expert_major),
                           MTLSizeMake(128, 1, 1), 0)) return 0;
     if (tails) {
-        const MTLSize tail_grid = MTLSizeMake((out_dim + 31u) / 32u, n_expert, 1);
+        const MTLSize tail_grid = MTLSizeMake((out_dim + rows_tg - 1u) / rows_tg, n_expert, 1);
         if (!qwen4_dispatch(k_nt1, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
         if (nt > 2u && !qwen4_dispatch(k_nt2, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
         if (nt > 4u && !qwen4_dispatch(k_nt4, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
