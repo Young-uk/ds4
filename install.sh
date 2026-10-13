@@ -3,12 +3,14 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/paperniuk/ds4/m1-flash-next/install.sh | bash
 #
-# It unpacks the latest release into ~/dstar (DSTAR_DIR to change),
+# It unpacks the latest release into ~/dstar (DSTAR_DIR to change, and
+# DSTAR_TAG for another release, such as a beta),
 # links the launcher into ~/.local/bin (DSTAR_BIN to change) and downloads
 # nothing else; `dstar pull` fetches the model.
 set -e
 DIR=${DSTAR_DIR:-$HOME/dstar}
 URL=https://github.com/paperniuk/ds4/releases/latest/download/dstar-macos-arm64.tar.gz
+[ -n "$DSTAR_TAG" ] && URL=https://github.com/paperniuk/ds4/releases/download/$DSTAR_TAG/dstar-macos-arm64.tar.gz
 
 if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
     echo "install: this package is for Apple Silicon Macs" >&2
