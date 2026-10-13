@@ -58891,6 +58891,7 @@ static struct {
     int aslot[DS4_MAX_LAYER];          /* index among the attention layers, -1 GDN */
     int moe_layer;                     /* the trunk layer qwen4_graph_moe runs, -1 other */
     bool pipe;                         /* two surface sets: chunks run in pairs */
+    bool lone;                         /* a chunk too short to halve, in pairs mode */
     bool attn_out;                     /* out also takes the attention layers' attn_output */
 } g_qwen4_ane = { .state = -1, .z = -1, .qkv = -1, .q = -1, .out = -1, .sh = -1, .moe_layer = -1 };
 
@@ -59056,7 +59057,7 @@ static bool qwen4_ane_split_gemv(int h, int slot, uint32_t gpu_cols, ds4_gpu_ten
 static bool qwen4_ane_gdn_kick(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                uint32_t il, uint32_t T) {
     const uint32_t slot = (uint32_t)g_qwen4_ane.slot[il];
-    const int z = g_qwen4_ane.z, qkv = g_qwen4_ane.qkv;
+    const int z = g_qwen4_ane.z, qkv = g_qwen4_ane.lone ? -1 : g_qwen4_ane.qkv;
     return qwen4_ane_stage(z, slot, 0, m, l->lin_gate, 0) &&
            (qkv < 0 || qwen4_ane_stage(qkv, slot, 0, m, l->lin_qkv, g_qwen4_ane.qkv_gpu)) &&
            ds4_gpu_ane_pack(z, g->mixed, T) &&
@@ -59066,7 +59067,7 @@ static bool qwen4_ane_gdn_kick(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
 static bool qwen4_ane_gdn_in(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                              uint32_t il, uint32_t T) {
     const uint32_t slot = (uint32_t)g_qwen4_ane.slot[il];
-    const int qkv = g_qwen4_ane.qkv;
+    const int qkv = g_qwen4_ane.lone ? -1 : g_qwen4_ane.qkv;
     const bool kicked = g->ane_kicked;
     g->ane_kicked = false;
     if (!kicked && !qwen4_ane_gdn_kick(g, m, l, il, T)) return false;
@@ -59120,7 +59121,7 @@ static bool qwen4_ane_attn_q(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
     const int h = g_qwen4_ane.q, slot = g_qwen4_ane.aslot[il];
     const bool kicked = g->ane_kicked;
     g->ane_kicked = false;
-    if (h < 0 || slot < 0) return qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
+    if (h < 0 || slot < 0 || g_qwen4_ane.lone) return qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
     if (!kicked && !qwen4_ane_attn_q_kick(g, m, l, il, T)) return false;
     return qwen4_gemv_rows(g_qwen4_ane.part, m, l->attn_q, g->mixed, T, g_qwen4_ane.q_gpu) &&
            ds4_gpu_ane_unpack(h, (uint32_t)slot, g->qg, T, (uint32_t)l->attn_q->dim[1], g_qwen4_ane.q_gpu,
@@ -59817,7 +59818,12 @@ static bool qwen4_graph_state_copy_ane(ds4_qwen4_gpu_graph *g, bool save) {
 /* A chunk the Neural Engine helps with starts from a copy of the recurrent
  * state.  If one of its evaluations failed, timed out or wrote non-finite
  * rows, the ANE stops and the GPU reruns the chunk alone from that copy
- * (attention rows of the chunk are simply written again). */
+ * (attention rows of the chunk are simply written again).  In pairs mode
+ * the qkv and attn_q programs leave the GPU only 256 columns, which a chunk
+ * without a partner waits on; one too short to halve into a pair
+ * (qwen4_graph_pair_tail) computes them on the GPU and keeps z and the
+ * shared expert on the ANE: a lone 700-row chunk 358 -> 396 tok/s, 1000
+ * rows 398 -> 410. */
 static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
     if (!g || !qwen4_ane_ready(m, w, T) || !qwen4_ane_on(T))
@@ -59829,7 +59835,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         return qwen4_graph_forward_tokens_once(g, m, w, tokens, T, logits_out, all_rows);
     }
     const bool snap1 = g->snap_after_first, snap2 = g->snap_after_second;
+    g_qwen4_ane.lone = g_qwen4_ane.pipe && T < 2u * g_qwen4_ane.min_rows;
     const bool ok = qwen4_graph_forward_tokens_once(g, m, w, tokens, T, logits_out, all_rows);
+    g_qwen4_ane.lone = false;
     if (qwen4_ane_settle()) return ok;
     fprintf(stderr, "ds4: rerunning the prefill chunk at %u (%u tokens) on the GPU\n", g->ane_pos, T);
     if (!qwen4_graph_state_copy_ane(g, false)) return false;

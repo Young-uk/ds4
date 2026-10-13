@@ -133,7 +133,10 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   Each layer then runs in three phases, so the output projections, ssm_out
   and attn_output, also go to the Neural Engine behind the other chunk's
   attention-side mix, all but their first 768 columns: 495 tok/s at 8K and
-  467 at 32K, for 0.1 GB more.
+  467 at 32K, for 0.1 GB more. A chunk alone that is too short to halve,
+  under 1024 rows, computes qkv and attn_q on the GPU, since the pair
+  programs would leave the GPU waiting: 700 rows go from 358 to 396 tok/s,
+  1000 rows from 398 to 410.
 - **Half activations in the Q2_0 expert tiles.** The register tiles stage
   x and mid in half, as the staged tiles on other chips do, and fold the
   block scale into the weights, so each tile reads half the activation
