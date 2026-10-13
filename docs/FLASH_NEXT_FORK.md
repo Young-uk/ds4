@@ -136,7 +136,12 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   467 at 32K, for 0.1 GB more. A chunk alone that is too short to halve,
   under 1024 rows, computes qkv and attn_q on the GPU, since the pair
   programs would leave the GPU waiting: 700 rows go from 358 to 396 tok/s,
-  1000 rows from 398 to 410.
+  1000 rows from 398 to 410. With `DS4_ANE=1` the KV buffers go into a
+  Metal residency set when they are allocated: after the Neural Engine's
+  evaluations the GPU otherwise mapped them in again on its next command
+  buffer, so the 5-token prompt tail after an ANE prefill took 190 ms
+  instead of 105 with 262K context. The footprint at a short context grows
+  by about 1 GB, and at 64K it is the same as before.
 - **Half activations in the Q2_0 expert tiles.** The register tiles stage
   x and mid in half, as the staged tiles on other chips do, and fold the
   block scale into the weights, so each tile reads half the activation

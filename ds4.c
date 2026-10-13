@@ -58393,6 +58393,28 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
     return t;
 }
 
+/* With the Neural Engine on (DS4_ANE=1) the KV buffers go into the session
+ * residency set when they are allocated: otherwise the first command buffer
+ * after the ANE's evaluations maps them in again, 85 ms for the prompt tail
+ * with 262K context.  Requesting residency here keeps that cost out of the
+ * first prefill chunk; it adds about 1 GB of footprint at a short context,
+ * well under what the KV takes once filled. */
+static void qwen4_graph_keep_kv_resident(ds4_qwen4_gpu_graph *g) {
+#ifdef DS4_HAS_QWEN4_METAL
+    const char *ane = getenv("DS4_ANE");
+    if (!ane || !ane[0] || strtoul(ane, NULL, 10) == 0) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor *kv[] = { g->layer_k_cache[il], g->layer_v_cache[il],
+                                 g->layer_ik_cache[il], g->layer_block_key[il] };
+        for (size_t i = 0; i < sizeof(kv) / sizeof(kv[0]); i++) {
+            if (kv[i]) (void)ds4_gpu_tensor_keep_resident(kv[i]);
+        }
+    }
+#else
+    (void)g;
+#endif
+}
+
 /* shared borrows the engine arena for the transients; NULL allocates private
  * ones.  A borrowing graph must fit inside the arena it borrows: the caller
  * checks cap_tokens and n_block_cap before passing one.
@@ -58536,6 +58558,7 @@ private_state:
         qwen4_graph_free(g);
         return false;
     }
+    qwen4_graph_keep_kv_resident(g);
     return true;
 }
 

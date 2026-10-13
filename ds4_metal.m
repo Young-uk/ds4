@@ -1122,6 +1122,7 @@ static id<MTLBuffer> g_stream_expert_validate_status_buffer;
 @property(nonatomic, assign) uint64_t offset;
 @property(nonatomic, assign) uint64_t bytes;
 @property(nonatomic, assign) uint8_t owner;
+@property(nonatomic, assign) BOOL resident;
 @end
 
 @implementation DS4MetalTensor
@@ -9361,6 +9362,65 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
     }
 }
 
+/* Session tensors the GPU keeps mapped while the ANE runs.  After ANE
+ * evaluations the next command buffer otherwise maps the large KV buffers
+ * in again: the 5-token prompt tail after an ANE prefill took 190 ms
+ * instead of 105 ms with 262K context allocated. */
+static id g_session_residency_set;
+static int g_session_residency_queued;
+static pthread_mutex_t g_session_residency_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void ds4_gpu_session_residency_remove(DS4MetalTensor *obj) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        pthread_mutex_lock(&g_session_residency_mu);
+        if (g_session_residency_set) {
+            [g_session_residency_set removeAllocation:obj.buffer];
+            [g_session_residency_set commit];
+        }
+        pthread_mutex_unlock(&g_session_residency_mu);
+    }
+#endif
+    obj.resident = NO;
+}
+
+int ds4_gpu_tensor_keep_resident(ds4_gpu_tensor *tensor) {
+    if (!tensor) return 0;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        if (!obj.buffer || !obj.owner) return 0;
+        if (obj.resident) return 1;
+        pthread_mutex_lock(&g_session_residency_mu);
+        if (!g_session_residency_set) {
+            MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+            desc.label = @"ds4_session";
+            desc.initialCapacity = 64;
+            NSError *error = nil;
+            g_session_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+            if (!g_session_residency_set) {
+                pthread_mutex_unlock(&g_session_residency_mu);
+                fprintf(stderr, "ds4: Metal session residency set creation failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+                return 0;
+            }
+        }
+        [g_session_residency_set addAllocation:obj.buffer];
+        [g_session_residency_set commit];
+        [g_session_residency_set requestResidency];
+        if (!g_session_residency_queued && g_queue &&
+            [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [g_queue addResidencySet:g_session_residency_set];
+            g_session_residency_queued = 1;
+        }
+        pthread_mutex_unlock(&g_session_residency_mu);
+        obj.resident = YES;
+        return 1;
+    }
+#endif
+    return 0;
+}
+
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     @autoreleasepool {
@@ -9376,6 +9436,7 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
             return;
         }
         DS4MetalTensor *obj = (__bridge_transfer DS4MetalTensor *)tensor;
+        if (obj.resident) ds4_gpu_session_residency_remove(obj);
         if (owner) {
             if (ds4_gpu_trace_allocs()) {
                 fprintf(stderr,

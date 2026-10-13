@@ -3420,6 +3420,9 @@ int ds4_gpu_ane_failed(void);
 /* Waits for the evaluations queued so far: 0 if one failed, timed out or
  * wrote non-finite rows, after which the ANE stays off. */
 int ds4_gpu_ane_settle(void);
+/* Adds an allocated tensor to the session residency set, so the GPU keeps
+ * it mapped across the ANE's evaluations; freeing the tensor removes it. */
+int ds4_gpu_tensor_keep_resident(ds4_gpu_tensor *tensor);
 
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
