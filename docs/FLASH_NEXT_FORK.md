@@ -134,6 +134,13 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   and attn_output, also go to the Neural Engine behind the other chunk's
   attention-side mix, all but their first 768 columns: 495 tok/s at 8K and
   467 at 32K, for 0.1 GB more.
+- **Half activations in the Q2_0 expert tiles.** The register tiles stage
+  x and mid in half, as the staged tiles on other chips do, and fold the
+  block scale into the weights, so each tile reads half the activation
+  bytes and the next K step's activations load during the multiplies.
+  Prefill goes from 379 to 397 tok/s at 8K on the GPU alone and from 499 to
+  530 with the Neural Engine (363 to 380 and 473 to 501 at 32K); the NLL
+  stays within the noise. `DS4_QWEN4_MOE_REG_HALF=0` keeps fp32 activations.
 
 Each change is a separate commit with a test.
 
