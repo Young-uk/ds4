@@ -141,6 +141,12 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   Prefill goes from 379 to 397 tok/s at 8K on the GPU alone and from 499 to
   530 with the Neural Engine (363 to 380 and 473 to 501 at 32K); the NLL
   stays within the noise. `DS4_QWEN4_MOE_REG_HALF=0` keeps fp32 activations.
+- **Disk KV checkpoints written once**: the server wrote each checkpoint
+  to a temporary file and then copied it into the cache directory, while
+  prefill waited. It now writes the payload straight into the cache file:
+  a 1.3 GB checkpoint at 41K tokens takes 0.32 s instead of 1.7 s, a 0.7 GB
+  one at 20K 0.18 s instead of 0.39 s. Distributed sessions still stage
+  the payload, since they learn its size only after gathering it.
 
 Each change is a separate commit with a test.
 
