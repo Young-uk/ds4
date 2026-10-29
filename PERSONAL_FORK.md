@@ -65,3 +65,24 @@ key assumptions and relevant alternatives; Max adds counterexamples, edge cases,
 failure modes, and independent checks where feasible. Low retains essential
 verification. Revised server regressions passed, and the paired local deployment
 reached Ready. These revised instructions have not been quality-benchmarked.
+
+## Reasoning-only termination diagnostics
+
+Chat completion logs now include a metadata-only `generation-diag` record with
+the request diagnostic ID, stop source and token ID, client-stop flag, open
+thinking state, parsed content/reasoning byte counts, tool-call count, generated
+token count and limits. This distinguishes early model termination from client
+stop sequences and output limits. No prompt, response text or custom stop string
+is included. Generation behavior is unchanged; no automatic retry is introduced.
+
+## Append-only tool catalog experiment (2026-10-30)
+
+Trusted system/developer `atomic-tools:v1:<JSON array>` events render tool
+catalogs at their recorded user-turn boundaries. When present, request-wide
+tool definitions no longer alter the initial Qwen system prefix. Historical
+calls use the parameter order from their recorded catalog, including live tool
+result suffixes. Unmarked callers retain the original renderer. Current API
+tools and the application's post-approval availability check remain the
+execution boundary; historical catalogs do not grant authority. Existing
+conversations can incur one migration prefill before later updates reuse their
+prefix. All new tool result tokens still require evaluation.

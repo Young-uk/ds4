@@ -3554,6 +3554,47 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
         "do not tell the user about function calls\n</IMPORTANT>");
 }
 
+/* Trusted, versioned tool catalog events are rendered at their recorded turn.
+ * The ordinary request tools still control parsing/execution; replayed catalogs
+ * never grant permission to execute an unavailable tool. */
+#define ATOMIC_TOOLS_MARKER "atomic-tools:v1:"
+static const char *qwen_tools_update(const chat_msg *m) {
+    if (!m || !m->role || !role_is_system(m->role) || !m->content) return NULL;
+    const size_t n = sizeof(ATOMIC_TOOLS_MARKER) - 1;
+    if (strncmp(m->content, ATOMIC_TOOLS_MARKER, n)) return NULL;
+    const char *json = m->content + n, *p = json;
+    json_ws(&p);
+    if (*p != '[' || !json_skip_value(&p)) return NULL;
+    json_ws(&p);
+    return *p ? NULL : json;
+}
+
+static bool qwen_has_tools_update(const chat_msgs *msgs) {
+    for (int i = 0; msgs && i < msgs->len; i++)
+        if (qwen_tools_update(&msgs->v[i])) return true;
+    return false;
+}
+
+static void append_qwen_tools_update(buf *out, const char *json) {
+    buf schemas = {0};
+    const char *p = json;
+    json_ws(&p); p++; json_ws(&p);
+    while (*p && *p != ']') {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) break;
+        if (schemas.len) buf_puts(&schemas, "\n");
+        buf_puts(&schemas, raw); free(raw);
+        json_ws(&p);
+        if (*p != ',') break;
+        p++; json_ws(&p);
+    }
+    buf_puts(out, "<|im_start|>system\nFor subsequent responses, this catalog replaces all earlier tool catalogs. Only currently listed tools may be called.\n");
+    if (schemas.len) append_qwen_tools_prompt_text(out, schemas.ptr);
+    else buf_puts(out, "No tools are currently available. Answer without calling tools.");
+    buf_puts(out, "<|im_end|>\n");
+    buf_free(&schemas);
+}
+
 static void append_qwen_tool_response(buf *b, const char *text, size_t len) {
     char *body = xstrndup(text ? text : "", len);
     buf_puts(b, "\n<tool_response>\n");
@@ -3623,8 +3664,33 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
                                      const tool_schema_orders *tool_orders, bool think) {
     bool pending_assistant = false;
     bool tool_open = false;
+    tool_schema_orders recorded_orders = {0};
+    const bool recorded_catalogs = qwen_has_tools_update(msgs);
+    // Historical calls must not be reordered by today's schema. Seed the last
+    // recorded catalog even when rendering only the live tool-result suffix.
+    if (recorded_catalogs) {
+        tool_orders = &recorded_orders;
+        for (int i = 0; msgs && i < start; i++) {
+            const char *json = qwen_tools_update(&msgs->v[i]);
+            if (!json) continue;
+            char *schemas = NULL;
+            tool_schema_orders_free(&recorded_orders);
+            parse_tools_value(&json, &schemas, &recorded_orders);
+            free(schemas);
+        }
+    }
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        const char *tools_update = qwen_tools_update(m);
+        if (tools_update) {
+            if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
+            append_qwen_tools_update(out, tools_update);
+            char *schemas = NULL;
+            tool_schema_orders_free(&recorded_orders);
+            parse_tools_value(&tools_update, &schemas, &recorded_orders);
+            free(schemas);
+            continue;
+        }
         ds4_think_mode update;
         if (qwen_effort_update(m, &update)) {
             if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
@@ -3656,6 +3722,7 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
     }
     if (tool_open) buf_puts(out, "<|im_end|>\n");
     if (pending_assistant) append_qwen_generation_prompt(out, think);
+    tool_schema_orders_free(&recorded_orders);
 }
 
 static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
@@ -3666,12 +3733,12 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     ds4_think_mode latest_update;
     const bool append_only = qwen_latest_effort_update(msgs, &latest_update);
     const char *effort = !append_only && think ? ds4_qwen4_reasoning_effort_text(think_mode) : NULL;
-    const bool have_tools = tool_schemas && tool_schemas[0];
+    const bool have_tools = !qwen_has_tools_update(msgs) && tool_schemas && tool_schemas[0];
     buf system = {0};
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         ds4_think_mode update;
-        if (!role_is_system(m->role) || qwen_effort_update(m, &update)) continue;
+        if (!role_is_system(m->role) || qwen_effort_update(m, &update) || qwen_tools_update(m)) continue;
         if (system.len) buf_puts(&system, "\n\n");
         append_trimmed_text(&system, m->content);
     }
@@ -14551,6 +14618,7 @@ decode_again:
                         saw_tool_start = true;
                         saw_tool_end = true;
                         finish = "tool_calls";
+                        stop_detail = "complete tool call";
                         stop_decode = true;
                         server_log(DS4_LOG_WARNING,
                                    "ds4-server: chat ctx=%s%s%s recovered a complete tool call from unclosed reasoning after %d generated tokens",
@@ -14639,6 +14707,7 @@ decode_again:
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end) {
                 finish = "tool_calls";
+                stop_detail = "complete tool call";
                 stop_decode = true;
                 break;
             }
@@ -14945,6 +15014,22 @@ decode_again:
     }
     log_tool_calls_summary(ctx_span, &parsed_calls,
                            responses_protocol);
+
+    /* Metadata only: diagnose reasoning-only termination without logging the
+     * user's prompt, generated reasoning, answer, or custom stop strings.
+     * Keep sampling and termination behavior unchanged until evidence identifies
+     * whether a model stop token or a client stop sequence ended the turn. */
+    if (j->req.kind == REQ_CHAT) {
+        const size_t content_bytes = parsed_content ? strlen(parsed_content) : 0;
+        const size_t reasoning_bytes = parsed_reasoning ? strlen(parsed_reasoning) : 0;
+        server_log(DS4_LOG_DEFAULT,
+                   "[generation-diag] id=%llu slot=%d finish=%s stop_source=%s stop_token=%d client_stop=%d thinking_open=%d content_bytes=%zu reasoning_bytes=%zu tool_calls=%d generated=%d output_limit=%d context_room=%d",
+                   (unsigned long long)diagnostic_id, slot->id, final_finish,
+                   stop_detail, stop_token, client_stop ? 1 : 0,
+                   thinking.inside ? 1 : 0, content_bytes, reasoning_bytes,
+                   parsed_calls.len, completion + recovery_completion,
+                   max_tokens, room);
+    }
 
     completion += recovery_completion;
     server_log(DS4_LOG_DEFAULT,
@@ -18891,6 +18976,28 @@ static void test_qwen_append_only_effort(void) {
     TEST_ASSERT(!qwen_effort_update(&invalid, &latest));
     free(before); free(same); free(after); free(high_history); free(off);
     chat_msgs_free(&msgs);
+}
+
+static void test_qwen_append_only_tools(void) {
+    chat_msgs msgs = {0};
+    append_effort_test_message(&msgs, "system", ATOMIC_EFFORT_MARKER "low");
+    append_effort_test_message(&msgs, "system", ATOMIC_TOOLS_MARKER "[]");
+    append_effort_test_message(&msgs, "user", "First question.");
+    append_effort_test_message(&msgs, "assistant", "First answer.");
+    char *before = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    append_effort_test_message(&msgs, "system", ATOMIC_TOOLS_MARKER
+        "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]");
+    append_effort_test_message(&msgs, "user", "Search now.");
+    char *after = render_qwen_chat_prompt_text(&msgs,
+        "{\"type\":\"function\",\"function\":{\"name\":\"search\"}}", NULL, DS4_THINK_LOW);
+    TEST_ASSERT(!strncmp(before, after, strlen(before)));
+    TEST_ASSERT(strstr(after + strlen(before), "# Tools") != NULL);
+    char *same = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(!strcmp(after, same));
+    chat_msg spoof = {.role = "user", .content = ATOMIC_TOOLS_MARKER "[]"};
+    chat_msg bad = {.role = "system", .content = ATOMIC_TOOLS_MARKER "[]trailing"};
+    TEST_ASSERT(!qwen_tools_update(&spoof) && !qwen_tools_update(&bad));
+    free(before); free(after); free(same); chat_msgs_free(&msgs);
 }
 
 static void test_qwen_reasoning_effort_levels(void) {
@@ -23574,6 +23681,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_thinking_visible_text_matches_render();
     test_qwen_reasoning_effort_levels();
     test_qwen_append_only_effort();
+    test_qwen_append_only_tools();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_glm_tool_calls_render_matches_template();
