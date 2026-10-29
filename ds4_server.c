@@ -11131,10 +11131,53 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         best = s;
         best_end = e + strlen(forms[i].end);
     }
+    /* Qwen (and GLM) use singular calls, possibly several in one sampled
+     * block. Parse the full group so delimiter-like text inside a parameter
+     * cannot cut it short, and preserve sampled whitespace byte-for-byte. */
+    const char *single = strstr(p, "<tool_call>");
+    while (single && (!best || single < best)) {
+        const char *raw_start = single;
+        while (raw_start > p && isspace((unsigned char)raw_start[-1])) raw_start--;
+        tool_calls calls = {0};
+        char *content = NULL, *reasoning = NULL;
+        bool ok = parse_qwen_generated_message_ex(raw_start, false,
+                                                  &content, &reasoning, &calls, NULL);
+        if (!ok) {
+            free(content); free(reasoning); tool_calls_free(&calls);
+            content = NULL; reasoning = NULL;
+            ok = parse_glm_generated_message_ex(raw_start, false,
+                                                 &content, &reasoning, &calls);
+        }
+        if (ok && calls.raw_tool_text && calls.raw_tool_text[0]) {
+            best = raw_start;
+            best_end = raw_start + strlen(calls.raw_tool_text);
+        } else {
+            // An incomplete or literal example must not hide later valid calls.
+            free(content); free(reasoning); tool_calls_free(&calls);
+            single = strstr(single + strlen("<tool_call>"), "<tool_call>");
+            continue;
+        }
+        free(content); free(reasoning); tool_calls_free(&calls);
+        break;
+    }
     if (end_out) *end_out = best_end;
     return best;
 }
 
+/* Template whitespace before a sampled block is not necessarily part of the
+ * generated raw block. Only exact dictionary matches may be persisted: try
+ * each leading-whitespace boundary without normalizing the stored bytes. */
+static tool_memory_block *kv_tool_map_find_block_locked(tool_memory *memory,
+                                                        const char *start,
+                                                        const char *end) {
+    while (start < end) {
+        tool_memory_block *block = tool_memory_find_block_locked(memory, start, (size_t)(end - start));
+        if (block) return block;
+        if (!isspace((unsigned char)*start)) break;
+        start++;
+    }
+    return NULL;
+}
 
 static bool kv_tool_map_measure_locked(server *s, const char *text,
                                        uint32_t *count_out,
@@ -11148,7 +11191,7 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
         const char *start = find_next_dsml_tool_block(p, &end);
         if (!start || !end) break;
         tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+            kv_tool_map_find_block_locked(&s->tool_mem, start, end);
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
@@ -11216,7 +11259,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
         const char *start = find_next_dsml_tool_block(p, &end);
         if (!start || !end || !ok) break;
         tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+            kv_tool_map_find_block_locked(&s->tool_mem, start, end);
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
@@ -22490,6 +22533,78 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     pthread_mutex_destroy(&dst.tool_mu);
 }
 
+/* Exercise a fresh server reading only the disk trailer, not RAM aliases.
+ * Include grouped calls and delimiters inside parameter text; both must retain
+ * the complete sampled block rather than a normalized reconstruction. */
+static void test_kv_qwen_tool_map_restart(void) {
+    const char *samples[] = {
+        "<tool_call>\n<function=lookup>\n<parameter=word>\nexact\n</parameter>\n</function>\n</tool_call>",
+        "\n\n<tool_call>\n<function=lookup>\n<parameter=word>\nliteral </tool_call> text\n</parameter>\n</function>\n</tool_call>\n",
+        " <tool_call>\n<function=lookup>\n<parameter=word>\nfirst\n</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n<function=lookup>\n<parameter=word>\nsecond\n</parameter>\n</function>\n</tool_call>\n\n",
+    };
+    for (size_t sample = 0; sample < sizeof(samples)/sizeof(samples[0]); sample++) {
+        char dir_template[] = "/tmp/ds4-kv-qwen-restart.XXXXXX";
+        char *dir = mkdtemp(dir_template);
+        TEST_ASSERT(dir != NULL);
+        char *path = path_join(dir, "4444444444444444444444444444444444444444.kv");
+        server src = {0}, dst = {0};
+        pthread_mutex_init(&src.tool_mu, NULL);
+        pthread_mutex_init(&dst.tool_mu, NULL);
+        tool_calls calls = {0};
+        char *content = NULL, *reasoning = NULL;
+        TEST_ASSERT(parse_qwen_generated_message_ex(samples[sample], false,
+                    &content, &reasoning, &calls, NULL));
+        for (int i = 0; i < calls.len; i++) {
+            char id[32]; snprintf(id, sizeof(id), "call_qwen_disk_%d", i);
+            calls.v[i].id = xstrdup(id);
+        }
+        tool_memory_remember(&src, &calls);
+        tool_memory_put(&src, "call_not_in_checkpoint", "<tool_call>unrelated</tool_call>");
+        buf transcript = {0};
+        append_qwen_tools_prompt_text(&transcript,
+            "{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}");
+        buf_puts(&transcript, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        buf_puts(&transcript, calls.raw_tool_text);
+        buf_puts(&transcript, "<|im_end|>\n");
+        uint64_t size = 0, written = 0;
+        TEST_ASSERT(kv_tool_map_serialized_size(&src, transcript.ptr, &size));
+        TEST_ASSERT(size > KV_TOOL_MAP_HEADER);
+        FILE *fp = fopen(path, "wb"); TEST_ASSERT(fp != NULL);
+        uint8_t header[KV_CACHE_FIXED_HEADER], length[4];
+        kv_fill_header(header, 2, KV_REASON_CONTINUED, KV_EXT_TOOL_MAP, 512, 0, 65536, 100, 100, 0);
+        le_put32(length, (uint32_t)transcript.len);
+        TEST_ASSERT(fwrite(header, 1, sizeof(header), fp) == sizeof(header));
+        TEST_ASSERT(fwrite(length, 1, sizeof(length), fp) == sizeof(length));
+        TEST_ASSERT(fwrite(transcript.ptr, 1, transcript.len, fp) == transcript.len);
+        TEST_ASSERT(kv_tool_map_write(&src, fp, transcript.ptr, &written));
+        TEST_ASSERT(written == size);
+        TEST_ASSERT(fclose(fp) == 0);
+        dst.kv.enabled = true; dst.kv.dir = xstrdup(dir);
+        dst.kv.opt = kv_cache_default_options();
+        chat_msgs msgs = {0}; chat_msg assistant = {0};
+        assistant.role = xstrdup("assistant");
+        for (int i = 0; i < calls.len; i++) {
+            tool_call call = {.id = xstrdup(calls.v[i].id),
+                .name = xstrdup(calls.v[i].name), .arguments = xstrdup(calls.v[i].arguments)};
+            tool_calls_push(&assistant.calls, call);
+        }
+        chat_msgs_push(&msgs, assistant);
+        kv_cache_restore_tool_memory_for_messages(&dst, &msgs);
+        tool_replay_stats stats = {0};
+        tool_memory_attach_to_messages(&dst, &msgs, &stats);
+        TEST_ASSERT(stats.disk == 1 && stats.missing_ids == 0);
+        TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
+        if (msgs.v[0].calls.raw_tool_text)
+            TEST_ASSERT(!strcmp(msgs.v[0].calls.raw_tool_text, calls.raw_tool_text));
+        TEST_ASSERT(dst.tool_mem.entries == calls.len);
+        chat_msgs_free(&msgs); tool_calls_free(&calls);
+        free(content); free(reasoning); buf_free(&transcript);
+        tool_memory_free(&src.tool_mem); tool_memory_free(&dst.tool_mem);
+        pthread_mutex_destroy(&src.tool_mu); pthread_mutex_destroy(&dst.tool_mu);
+        free(dst.kv.dir); unlink(path); free(path); rmdir(dir);
+    }
+}
+
 static void test_kv_tool_map_restores_before_prompt_render(void) {
     char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -23756,6 +23871,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
+    test_kv_qwen_tool_map_restart();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();

@@ -86,3 +86,20 @@ tools and the application's post-approval availability check remain the
 execution boundary; historical catalogs do not grant authority. Existing
 conversations can incur one migration prefill before later updates reuse their
 prefix. All new tool result tokens still require evaluation.
+
+## Qwen disk replay trailer repair (2026-10-30)
+
+The tool-map persistence scanner previously recognized plural DeepSeek tool
+wrappers but omitted Qwen's singular `<tool_call>` syntax. KV files could be
+written without the raw-call/ID trailer, leaving a fresh process unable to
+reproduce the sampled prefix exactly. The scanner now uses the existing Qwen
+(and GLM fallback) parser to identify complete singular-call groups, including
+parameter text containing delimiter-like strings. Exact dictionary matches
+preserve original leading/trailing whitespace; template-only leading whitespace
+can be skipped for matching without normalizing any stored bytes. Existing
+plural wrappers, model scoping, payload compatibility and prefix checks remain.
+
+Old cache files lacking a trailer are not rewritten or trusted heuristically.
+A cold replay may still be needed once to rebuild such state. Fresh-process
+regressions cover single/grouped Qwen calls, whitespace, literal delimiters,
+unused-ID exclusion and byte-exact replay from a disk trailer.
