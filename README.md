@@ -1,3 +1,10 @@
+> **Unofficial personal fork**
+>
+> Personal changes on top of [paperniuk/ds4](https://github.com/paperniuk/ds4),
+> itself a fork of [antirez/ds4](https://github.com/antirez/ds4).
+> This is not an official Dstar release. See [PERSONAL_FORK.md](PERSONAL_FORK.md)
+> for the change scope, verification, and compatibility limits.
+
 # ds4 Flash-Next: Qwen3.8-Flash-Next on Apple Silicon
 
 A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar), tuned

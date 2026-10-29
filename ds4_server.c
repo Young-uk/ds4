@@ -12069,6 +12069,134 @@ static void trace_write_cache_diag(
     }
 }
 
+/* Personal diagnostic build: counts and bounded token-prefix fingerprints only.
+ * Never log prompt text, token IDs, output text, headers, paths or tool arguments.
+ * These SHA-1 values are comparison fingerprints, not security checksums. */
+static void cache_diagnostic_line(buf *out, const request *r,
+                                  const trace_cache_diag *d, uint64_t id,
+                                  int slot, int cached, int effective,
+                                  int disk_cached, const char *source) {
+    const int old = d && d->valid ? d->old_pos : 0;
+    const int common = d && d->valid ? d->common : 0;
+    const int mismatch = old > 0 && common < old ? common : -1;
+    buf_printf(out,
+        "[cache-diag] event=begin id=%llu slot=%d prompt=%d effective=%d "
+        "live=%d common=%d first_mismatch=%d cached=%d uncached=%d disk_cached=%d "
+        "source=%s reason=%s images=%zu tools=%d echoes_reasoning=%d "
+        "replay_mem=%d replay_disk=%d replay_canonical=%d replay_missing=%d",
+        (unsigned long long)id, slot, r->prompt.len, effective, old, common,
+        mismatch, cached, effective > cached ? effective - cached : 0,
+        disk_cached, source, trace_cache_miss_reason(d), r->image_count,
+        r->has_tools ? 1 : 0, r->prompt_echoes_reasoning ? 1 : 0,
+        r->tool_replay.mem, r->tool_replay.disk, r->tool_replay.canonical,
+        r->tool_replay.missing_ids);
+    const int sizes[] = {256, 1024, 4096, 16384, 32768};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        const int count = r->prompt.len < sizes[i] ? r->prompt.len : sizes[i];
+        if (count <= 0) break;
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(r->prompt.v, (size_t)count * sizeof(*r->prompt.v), sha);
+        buf_printf(out, " prefix_%d=%s", count, sha);
+        if (count == r->prompt.len) break;
+    }
+}
+
+/* Compare bounded decoded tails before cache restoration changes the session.
+ * Only classifications and lengths leave this helper; decoded text is freed. */
+static bool diagnostic_space(unsigned char c) {
+    return c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\f' || c == '\v';
+}
+
+static const char *diagnostic_tail_class(const char *a, size_t an,
+                                         const char *b, size_t bn, bool complete) {
+    if (!complete) return "bounded-inconclusive";
+    if (bn >= an && !memcmp(a, b, an)) return "same-decoded-prefix";
+    size_t i = 0, k = 0;
+    while (i < an) {
+        if (diagnostic_space((unsigned char)a[i])) { i++; continue; }
+        while (k < bn && diagnostic_space((unsigned char)b[k])) k++;
+        if (k == bn || a[i] != b[k]) return "text-differs";
+        i++; k++;
+    }
+    return "whitespace-only-prefix";
+}
+
+typedef struct {
+    const char *classification;
+    int start, live_count, prompt_count;
+    bool complete;
+    size_t live_bytes, prompt_bytes, common_bytes;
+} diagnostic_tail;
+
+static diagnostic_tail capture_diagnostic_tail(ds4_engine *engine,
+        const ds4_tokens *live, const ds4_tokens *prompt, int old, int common) {
+    diagnostic_tail d = {.classification = "not-needed"};
+    if (!live || old <= 0 || common >= old) return d;
+    d.start = common > 8 ? common - 8 : 0;
+    int available = live->len < old ? live->len : old;
+    if (d.start >= available || d.start >= prompt->len) {
+        d.classification = "unavailable";
+        return d;
+    }
+    d.live_count = available - d.start;
+    d.complete = d.live_count <= 512;
+    if (d.live_count > 512) d.live_count = 512;
+    d.prompt_count = prompt->len - d.start;
+    if (d.prompt_count > 1024) d.prompt_count = 1024;
+    ds4_tokens a = {.v = live->v + d.start, .len = d.live_count};
+    ds4_tokens b = {.v = prompt->v + d.start, .len = d.prompt_count};
+    char *at = render_tokens_text(engine, &a, &d.live_bytes);
+    char *bt = render_tokens_text(engine, &b, &d.prompt_bytes);
+    if (at && bt) {
+        while (d.common_bytes < d.live_bytes && d.common_bytes < d.prompt_bytes &&
+               at[d.common_bytes] == bt[d.common_bytes]) d.common_bytes++;
+        d.classification = diagnostic_tail_class(at, d.live_bytes, bt, d.prompt_bytes, d.complete);
+    } else d.classification = "unavailable";
+    free(at); free(bt);
+    return d;
+}
+
+/* Sampled tokens need not equal re-tokenized tokens even when every decoded
+ * byte agrees. Keep the sampled frontier only for an exact byte prefix. Never
+ * normalize whitespace or accept a partial comparison for cache reuse. */
+static char *exact_decoded_suffix(const char *live, size_t ln,
+                                  const char *incoming, size_t pn) {
+    if (!live || !incoming || !ln || pn <= ln ||
+        memchr(live, 0, ln) || memchr(incoming, 0, pn) ||
+        memcmp(live, incoming, ln)) return NULL;
+    return xstrndup(incoming + ln, pn - ln);
+}
+
+static bool build_retokenized_live_suffix(server *s, server_slot *slot,
+        const request *req, int common, bool vision_match, ds4_tokens *out) {
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    /* Keep this recovery narrow: ordinary Qwen chat, an unchanged token prefix,
+     * a bounded text tail, and no images crossing the comparison boundary.
+     * Protocol-bound continuations retain their existing validation rules. */
+    if (!live || !vision_match || req->kind != REQ_CHAT ||
+        req->api != API_OPENAI || req->model_syntax != SERVER_MODEL_SYNTAX_QWEN ||
+        common <= 0 || common >= live->len || common >= req->prompt.len ||
+        live->len - common > 512 || req->prompt.len - common > 4096) return false;
+    for (size_t i = 0; i < req->image_count; i++) {
+        uint64_t end = (uint64_t)req->images[i].token_start +
+                       req->images[i].embedding.token_count;
+        if (end > (uint64_t)common) return false;
+    }
+    ds4_tokens a = {.v = live->v + common, .len = live->len - common};
+    ds4_tokens b = {.v = req->prompt.v + common, .len = req->prompt.len - common};
+    size_t an = 0, bn = 0;
+    char *at = render_tokens_text(s->engine, &a, &an);
+    char *bt = render_tokens_text(s->engine, &b, &bn);
+    char *suffix = exact_decoded_suffix(at, an, bt, bn);
+    free(at); free(bt);
+    if (!suffix) return false;
+    bool ok = build_live_prompt_suffix(s, slot, req, suffix, out);
+    free(suffix);
+    return ok;
+}
+
+static uint64_t cache_diagnostic_sequence;
+
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common) {
     if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
@@ -12833,6 +12961,19 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     int display_current = current - display_start;
     if (display_current < 0) display_current = 0;
     if (display_current > display_total) display_current = display_total;
+    /* SSE comments preserve OpenAI compatibility: ordinary clients ignore them.
+     * The personal app observes counts only, never conversation content. */
+    if (p->stream && p->headers_sent && !p->stream_failed) {
+        char update[256];
+        int n = snprintf(update, sizeof(update),
+            ": atomic-progress {\"processed\":%d,\"total\":%d,\"cache\":%d,\"time_ms\":%.0f}\n\n",
+            display_current, display_total, display_start, elapsed * 1000.0);
+        if (n > 0 && n < (int)sizeof(update) && !send_all(p->fd, update, (size_t)n)) {
+            p->stream_failed = true;
+            job_mark_cancelled(p->request_job);
+            return;
+        }
+    }
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
     int interval_tokens = p->seen ? current - p->last_current : 0;
@@ -13531,6 +13672,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
+    const diagnostic_tail tail_diag = capture_diagnostic_tail(s->engine,
+        ds4_session_tokens(slot->session), &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
@@ -13712,6 +13855,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cached = 0;
         break;
     }
+    if (!live_materialized && reuse.kind == REUSE_NONE &&
+        build_retokenized_live_suffix(s, slot, &j->req, common,
+                                      live_vision_match, &effective_prompt)) {
+        cached = old_pos;
+        live_materialized = true;
+        cache_source = "memory-decoded-tail";
+        prompt_for_sync = &effective_prompt;
+    }
     if (live_continuation_unavailable(&j->req, live_materialized)) {
         ds4_tokens_free(&effective_prompt);
         if (j->req.api == API_ANTHROPIC) {
@@ -13774,6 +13925,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     j->req.cache_read_tokens = cached;
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
+    const uint64_t diagnostic_id = __atomic_add_fetch(&cache_diagnostic_sequence, 1, __ATOMIC_RELAXED);
+    buf diagnostic = {0};
+    cache_diagnostic_line(&diagnostic, &j->req, &cache_diag, diagnostic_id,
+                          slot->id, cached, prompt_tokens, disk_cached, cache_source);
+    buf_printf(&diagnostic, " tail_class=%s tail_start=%d tail_live_tokens=%d "
+        "tail_prompt_tokens=%d tail_complete=%d tail_live_bytes=%zu "
+        "tail_prompt_bytes=%zu tail_common_bytes=%zu",
+        tail_diag.classification, tail_diag.start, tail_diag.live_count,
+        tail_diag.prompt_count, tail_diag.complete, tail_diag.live_bytes,
+        tail_diag.prompt_bytes, tail_diag.common_bytes);
+    server_log(DS4_LOG_DEFAULT, "%s", diagnostic.ptr);
+    buf_free(&diagnostic);
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
@@ -13981,6 +14144,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
         }
     }
+    server_log(DS4_LOG_DEFAULT,
+               "[cache-diag] event=prefill_done id=%llu slot=%d elapsed_ms=%.3f cached=%d uncached=%d",
+               (unsigned long long)diagnostic_id, slot->id, (now_sec() - t0) * 1000.0,
+               cached, prompt_tokens > cached ? prompt_tokens - cached : 0);
     char id[96];
     responses_random_id(id, sizeof(id),
                         j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
@@ -14705,6 +14872,10 @@ decode_again:
                            responses_protocol);
 
     completion += recovery_completion;
+    server_log(DS4_LOG_DEFAULT,
+               "[cache-diag] event=finish id=%llu slot=%d elapsed_ms=%.3f generated=%d finish=%s",
+               (unsigned long long)diagnostic_id, slot->id, (now_sec() - t0) * 1000.0,
+               completion, final_finish);
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
@@ -21375,6 +21546,29 @@ static void test_cancelled_progress_callback_is_inert(void) {
     test_cancel_job_destroy(&j);
 }
 
+static void test_prefill_progress_comment_counts_only(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    server_prefill_progress progress = {
+        .fd = sv[0], .stream = true, .prompt_tokens = 100,
+        .cached_tokens = 80, .t0 = now_sec(),
+    };
+    server_progress_cb(&progress, "prefill_chunk", 90, 100);
+    TEST_ASSERT(!progress.stream_failed);
+    shutdown(sv[0], SHUT_WR);
+    char received[2048] = {0};
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof(received) - 1 &&
+           (n = recv(sv[1], received + used, sizeof(received) - 1 - used, 0)) > 0)
+        used += (size_t)n;
+    TEST_ASSERT(strstr(received, "text/event-stream") != NULL);
+    TEST_ASSERT(strstr(received,
+        ": atomic-progress {\"processed\":10,\"total\":20,\"cache\":80,") != NULL);
+    TEST_ASSERT(strstr(received, "data:") == NULL);
+    close(sv[0]); close(sv[1]);
+}
+
 static void test_cancel_server_init(server *s) {
     memset(s, 0, sizeof(*s));
     pthread_mutex_init(&s->mu, NULL);
@@ -23139,7 +23333,77 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_cache_diagnostics_are_metadata_only(void) {
+    int ids[] = {11, 22, 33, 44};
+    request r = {0};
+    r.prompt.v = ids; r.prompt.len = 4;
+    r.raw_body = "PRIVATE_REQUEST_SECRET";
+    r.prompt_text = "PRIVATE_RENDERED_SECRET";
+    r.image_count = 1;
+    trace_cache_diag d = {0};
+    d.valid = true; d.old_pos = 4; d.common = 2; d.rewind_to = -1;
+    buf a = {0}, b = {0};
+    cache_diagnostic_line(&a, &r, &d, 7, 0, 0, 4, 0, "none");
+    cache_diagnostic_line(&b, &r, &d, 7, 0, 0, 4, 0, "none");
+    TEST_ASSERT(!strcmp(a.ptr, b.ptr));
+    TEST_ASSERT(strstr(a.ptr, "first_mismatch=2") != NULL);
+    TEST_ASSERT(strstr(a.ptr, "uncached=4") != NULL);
+    TEST_ASSERT(strstr(a.ptr, "images=1") != NULL);
+    TEST_ASSERT(strstr(a.ptr, "PRIVATE_") == NULL);
+    ids[2] = 55;
+    buf c = {0};
+    cache_diagnostic_line(&c, &r, &d, 7, 0, 0, 4, 0, "none");
+    TEST_ASSERT(strcmp(a.ptr, c.ptr) != 0);
+    buf_free(&a); buf_free(&b); buf_free(&c);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    TEST_ASSERT(!strcmp(diagnostic_tail_class("abc", 3, "abcdef", 6, true), "same-decoded-prefix"));
+    TEST_ASSERT(!strcmp(diagnostic_tail_class("a\n b", 4, "a b next", 8, true), "whitespace-only-prefix"));
+    TEST_ASSERT(!strcmp(diagnostic_tail_class("abc", 3, "axc", 3, true), "text-differs"));
+    TEST_ASSERT(!strcmp(diagnostic_tail_class("abc", 3, "ab", 2, true), "text-differs"));
+    TEST_ASSERT(!strcmp(diagnostic_tail_class("abc", 3, "abc", 3, false), "bounded-inconclusive"));
+    TEST_ASSERT(!strcmp(diagnostic_tail_class("a\0b", 3, "a\0c", 3, true), "text-differs"));
+    TEST_ASSERT(!strcmp(diagnostic_tail_class("한글", strlen("한글"), "한글 next", strlen("한글 next"), true), "same-decoded-prefix"));
+    char *suffix = exact_decoded_suffix("한글 reply<|im_end|>", strlen("한글 reply<|im_end|>"),
+        "한글 reply<|im_end|>\nnext", strlen("한글 reply<|im_end|>\nnext"));
+    TEST_ASSERT(suffix && !strcmp(suffix, "\nnext"));
+    free(suffix);
+    TEST_ASSERT(!exact_decoded_suffix("a b", 3, "a  b next", 9));
+    TEST_ASSERT(!exact_decoded_suffix("abc", 3, "axc next", 8));
+    TEST_ASSERT(!exact_decoded_suffix("abc", 3, "ab", 2));
+    TEST_ASSERT(!exact_decoded_suffix("abc", 3, "abc", 3));
+    TEST_ASSERT(!exact_decoded_suffix("a\0b", 3, "a\0b next", 8));
+    /* Unsafe cases must fail before detokenization, even without an engine. */
+    int frontier[] = {10, 20, 30, 40};
+    server safety_server = {0};
+    server_slot safety_slot = {0};
+    safety_slot.session = ds4_session_new_test_checkpoint(frontier, 4);
+    request safety_req = {0};
+    safety_req.kind = REQ_CHAT;
+    safety_req.api = API_OPENAI;
+    safety_req.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    safety_req.prompt.v = frontier;
+    safety_req.prompt.len = 4;
+    ds4_tokens safety_out = {0};
+    TEST_ASSERT(!build_retokenized_live_suffix(&safety_server, &safety_slot,
+        &safety_req, 1, false, &safety_out));
+    safety_req.api = API_RESPONSES;
+    TEST_ASSERT(!build_retokenized_live_suffix(&safety_server, &safety_slot,
+        &safety_req, 1, true, &safety_out));
+    safety_req.api = API_OPENAI;
+    ds4_vision_span safety_image = {0};
+    safety_image.token_start = 1;
+    safety_image.embedding.token_count = 2;
+    safety_req.images = &safety_image;
+    safety_req.image_count = 1;
+    TEST_ASSERT(!build_retokenized_live_suffix(&safety_server, &safety_slot,
+        &safety_req, 1, true, &safety_out));
+    TEST_ASSERT(!build_retokenized_live_suffix(&safety_server, &safety_slot,
+        &safety_req, 0, true, &safety_out));
+    TEST_ASSERT(safety_out.len == 0);
+    ds4_session_free_test_checkpoint(safety_slot.session);
+    test_cache_diagnostics_are_metadata_only();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
@@ -23281,6 +23545,7 @@ static void ds4_server_unit_tests_run(void) {
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
+    test_prefill_progress_comment_counts_only();
     test_cancelled_progress_callback_is_inert();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();
