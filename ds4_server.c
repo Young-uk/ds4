@@ -3077,6 +3077,65 @@ static bool role_is_system(const char *role) {
     return !strcmp(role, "system") || !strcmp(role, "developer");
 }
 
+/* Personal append-only effort protocol. Only trusted system/developer
+ * messages with an exact versioned marker are configuration events. Ordinary
+ * user text and all unmarked requests retain the upstream template. */
+#define ATOMIC_EFFORT_MARKER "atomic-effort:v1:"
+static bool qwen_effort_update(const chat_msg *m, ds4_think_mode *mode) {
+    if (!m || !m->role || !role_is_system(m->role) || !m->content) return false;
+    const size_t n = sizeof(ATOMIC_EFFORT_MARKER) - 1;
+    if (strncmp(m->content, ATOMIC_EFFORT_MARKER, n)) return false;
+    const char *level = m->content + n;
+    if (!strcmp(level, "off")) { *mode = DS4_THINK_NONE; return true; }
+    if (!strcmp(level, "low")) { *mode = DS4_THINK_LOW; return true; }
+    if (!strcmp(level, "medium")) { *mode = DS4_THINK_MEDIUM; return true; }
+    if (!strcmp(level, "high")) { *mode = DS4_THINK_HIGH; return true; }
+    if (!strcmp(level, "max")) { *mode = DS4_THINK_MAX; return true; }
+    return false;
+}
+
+static bool qwen_latest_effort_update(const chat_msgs *msgs, ds4_think_mode *mode) {
+    bool found = false;
+    for (int i = 0; msgs && i < msgs->len; i++)
+        if (qwen_effort_update(&msgs->v[i], mode)) found = true;
+    return found;
+}
+
+/* These prospective instructions belong only to the opt-in protocol. Keep
+ * the original unmarked request template unchanged for other clients. */
+static const char *qwen_append_effort_instruction(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_NONE:
+        return "Reasoning is disabled. Answer directly without a thinking phase.";
+    case DS4_THINK_LOW:
+        return "Reasoning effort is set to low. Use concise, focused reasoning. "
+            "Verify essential facts and calculations, and avoid unnecessary elaboration.";
+    case DS4_THINK_MEDIUM:
+        return "Reasoning effort is set to medium. Use balanced reasoning, "
+            "check important assumptions, and provide a well-supported answer "
+            "without unnecessary analysis.";
+    case DS4_THINK_HIGH:
+        return "Reasoning effort is set to high. Reason carefully through the task, "
+            "verify key assumptions and calculations, and consider relevant alternatives. "
+            "Stop when the conclusion is sufficiently supported; avoid redundant analysis.";
+    case DS4_THINK_MAX:
+        return "Reasoning effort is set to xhigh (maximum). Use thorough reasoning "
+            "for difficult parts of the task. In addition to checking key assumptions "
+            "and calculations, actively look for counterexamples, edge cases, and "
+            "failure modes. Where feasible, verify the conclusion with an independent "
+            "method. Resolve material inconsistencies before answering, and avoid "
+            "repeating checks that add no useful evidence.";
+    }
+    return "";
+}
+
+static void append_qwen_effort_update(buf *out, ds4_think_mode mode) {
+    buf_puts(out, "<|im_start|>system\nFor responses from this point onward, "
+        "replace earlier reasoning-effort instructions with the following setting. ");
+    buf_puts(out, qwen_append_effort_instruction(mode));
+    buf_puts(out, "<|im_end|>\n");
+}
+
 static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
@@ -3566,6 +3625,13 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
     bool tool_open = false;
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        ds4_think_mode update;
+        if (qwen_effort_update(m, &update)) {
+            if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
+            append_qwen_effort_update(out, update);
+            think = ds4_think_mode_enabled(update);
+            continue;
+        }
         if (role_is_system(m->role)) continue;
         if (chat_msg_is_glm_tool_result(m)) {
             if (!tool_open) buf_puts(out, "<|im_start|>user");
@@ -3597,12 +3663,15 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
                                           const tool_schema_orders *tool_orders,
                                           ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
-    const char *effort = think ? ds4_qwen4_reasoning_effort_text(think_mode) : NULL;
+    ds4_think_mode latest_update;
+    const bool append_only = qwen_latest_effort_update(msgs, &latest_update);
+    const char *effort = !append_only && think ? ds4_qwen4_reasoning_effort_text(think_mode) : NULL;
     const bool have_tools = tool_schemas && tool_schemas[0];
     buf system = {0};
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (!role_is_system(m->role)) continue;
+        ds4_think_mode update;
+        if (!role_is_system(m->role) || qwen_effort_update(m, &update)) continue;
         if (system.len) buf_puts(&system, "\n\n");
         append_trimmed_text(&system, m->content);
     }
@@ -4316,6 +4385,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    ds4_think_mode append_effort;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        qwen_latest_effort_update(&msgs, &append_effort)) {
+        reasoning_effort = append_effort;
+        thinking_enabled = ds4_think_mode_enabled(append_effort);
+    }
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
@@ -18768,6 +18843,56 @@ static void test_render_qwen_chat_prompt_text(void) {
     chat_msgs_free(&msgs);
 }
 
+static void append_effort_test_message(chat_msgs *msgs, const char *role, const char *text) {
+    chat_msg m = {0};
+    m.role = xstrdup(role); m.content = xstrdup(text);
+    chat_msgs_push(msgs, m);
+}
+
+static void test_qwen_append_only_effort(void) {
+    TEST_ASSERT(strcmp(qwen_append_effort_instruction(DS4_THINK_HIGH),
+                       qwen_append_effort_instruction(DS4_THINK_MAX)) != 0);
+    TEST_ASSERT(strstr(qwen_append_effort_instruction(DS4_THINK_LOW), "Verify essential facts") != NULL);
+    TEST_ASSERT(strstr(qwen_append_effort_instruction(DS4_THINK_HIGH), "relevant alternatives") != NULL);
+    TEST_ASSERT(strstr(qwen_append_effort_instruction(DS4_THINK_MAX), "counterexamples") != NULL);
+    TEST_ASSERT(strstr(qwen_append_effort_instruction(DS4_THINK_MAX), "independent method") != NULL);
+    chat_msgs msgs = {0};
+    append_effort_test_message(&msgs, "system", "Stable instructions.");
+    append_effort_test_message(&msgs, "user", "Legacy history.");
+    append_effort_test_message(&msgs, "assistant", "Legacy answer.");
+    append_effort_test_message(&msgs, "system", ATOMIC_EFFORT_MARKER "low");
+    append_effort_test_message(&msgs, "user", "First recorded turn.");
+    append_effort_test_message(&msgs, "assistant", "First answer.");
+    char *before = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    char *same = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MAX);
+    /* The request-level setting cannot rewrite already recorded history. */
+    TEST_ASSERT(!strcmp(before, same));
+    TEST_ASSERT(strstr(before, "<|im_start|>system\nStable instructions.") == before);
+    TEST_ASSERT(strstr(before, ATOMIC_EFFORT_MARKER) == NULL);
+    TEST_ASSERT(strstr(before, "Legacy answer.") < strstr(before, "Reasoning effort is set to low."));
+    append_effort_test_message(&msgs, "system", ATOMIC_EFFORT_MARKER "max");
+    append_effort_test_message(&msgs, "user", "Now use more reasoning.");
+    char *after = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MAX);
+    TEST_ASSERT(!strncmp(before, after, strlen(before)));
+    TEST_ASSERT(strstr(after + strlen(before), "Reasoning effort is set to xhigh (maximum).") != NULL);
+    ds4_think_mode latest = DS4_THINK_LOW;
+    TEST_ASSERT(qwen_latest_effort_update(&msgs, &latest) && latest == DS4_THINK_MAX);
+    append_effort_test_message(&msgs, "assistant", "Second answer.");
+    char *high_history = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MAX);
+    append_effort_test_message(&msgs, "system", ATOMIC_EFFORT_MARKER "off");
+    append_effort_test_message(&msgs, "user", "Answer directly.");
+    char *off = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(!strncmp(high_history, off, strlen(high_history)));
+    TEST_ASSERT(strstr(off, "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
+    TEST_ASSERT(qwen_latest_effort_update(&msgs, &latest) && latest == DS4_THINK_NONE);
+    chat_msg untrusted = {.role = "user", .content = ATOMIC_EFFORT_MARKER "max"};
+    TEST_ASSERT(!qwen_effort_update(&untrusted, &latest));
+    chat_msg invalid = {.role = "system", .content = ATOMIC_EFFORT_MARKER "low trailing text"};
+    TEST_ASSERT(!qwen_effort_update(&invalid, &latest));
+    free(before); free(same); free(after); free(high_history); free(off);
+    chat_msgs_free(&msgs);
+}
+
 static void test_qwen_reasoning_effort_levels(void) {
     bool enabled = true, got = false;
     ds4_think_mode mode = DS4_THINK_HIGH;
@@ -23448,6 +23573,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_checkpoint_suffix_matches_render();
     test_qwen_thinking_visible_text_matches_render();
     test_qwen_reasoning_effort_levels();
+    test_qwen_append_only_effort();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_glm_tool_calls_render_matches_template();

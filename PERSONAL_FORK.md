@@ -37,3 +37,31 @@ organizing this branch; model files and caches are not part of the repository.
 
 Atomic Chat integration is maintained independently in
 [Young-uk/Atomic-Chat](https://github.com/Young-uk/Atomic-Chat).
+
+
+## Append-only effort experiment (2026-10-30)
+
+The local `experiment/append-effort-oct30` branch recognizes exact trusted
+system/developer messages `atomic-effort:v1:<off|low|medium|high|max>` in Qwen
+chat-completion requests. It renders separate prospective instructions in
+place instead of hoisting a changed effort into the first system message.
+Requests without these events preserve the existing template. This must be
+paired with Atomic's opt-in `VITE_DSTAR_APPEND_EFFORT=true` user-turn metadata
+replay. The paired experiment is now enabled in the locally installed Personal
+app and Dstar executable for user testing; it has not been pushed.
+
+In the first experiment, before the final English instruction refinement,
+an isolated synthetic 2,564-token conversation was tested: the first prefill used
+16.153 seconds. Later Max/Medium/Off transitions reused 3,163/3,732/3,891 tokens
+and processed only 115/90/92 new tokens, taking 1.505/1.283/1.541 seconds for
+prefill. Off emitted no reasoning content. The arithmetic answers were correct,
+but Max did not reason longer than Low on this repeated simple problem; this
+is not evidence of a general quality or reasoning-strength improvement.
+Existing server/agent/web-recovery regressions passed. No model files or real
+conversation were modified; the original installed server was restored Ready.
+
+The subsequent English refinement distinguishes High from Max: High focuses on
+key assumptions and relevant alternatives; Max adds counterexamples, edge cases,
+failure modes, and independent checks where feasible. Low retains essential
+verification. Revised server regressions passed, and the paired local deployment
+reached Ready. These revised instructions have not been quality-benchmarked.
