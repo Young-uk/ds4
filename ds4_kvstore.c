@@ -1017,6 +1017,11 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return true;
     }
 
+    /* Staging can dominate shutdown for long contexts. Log before touching GPU
+     * state so an interrupted save is distinguishable from an absent attempt. */
+    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+            "%s: kv cache staging tokens=%d reason=%s", kv_log_name(kc),
+            store_tokens.len, reason);
     ds4_session_payload_file staged = {0};
     if (ds4_session_stage_payload(session, &staged,
                                   save_err, sizeof(save_err)) != 0) {

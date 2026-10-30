@@ -103,3 +103,43 @@ Old cache files lacking a trailer are not rewritten or trusted heuristically.
 A cold replay may still be needed once to rebuild such state. Fresh-process
 regressions cover single/grouped Qwen calls, whitespace, literal delimiters,
 unused-ID exclusion and byte-exact replay from a disk trailer.
+
+## Model-authored interim assessments
+
+A trusted `atomic-tool-preamble:v1` event renders a prospective English policy
+at a newly recorded turn without rewriting past catalog text. The model chooses
+what interim understanding is useful to communicate and how much detail it
+needs. There is no fixed phrase or sentence count and no app-generated dialogue.
+The function-only tool format applies to the call block, not preceding prose.
+Approval and execution rules remain unchanged. Keep deployed v1 wording
+immutable; future wording changes require a new versioned event.
+
+### Canonical Qwen final-answer disk keys
+
+Qwen final-answer checkpoints now use the existing assistant-message renderer
+for their disk replay key, including echoed reasoning and the renderer's content
+whitespace rules. The saved KV payload is unchanged. This avoids falling back to
+an older checkpoint when sampled whitespace differs from the next request's
+rendered history. Non-Qwen behavior and exact-prefix rejection for edited
+reasoning remain unchanged. Existing raw-token snapshots are not rewritten.
+
+Regression coverage compares replay keys with the actual next-request renderer
+for echoed/omitted reasoning and verifies edited reasoning is rejected. Real
+model validation uses isolated cache directories and synthetic conversations;
+results distinguish simple, mixed-history, leading-whitespace, and long-context
+restart cases instead of treating a short successful restart as complete proof.
+
+### Bound empty Qwen Chat Completions recovery
+
+For Qwen OpenAI Chat Completions, a normal model stop with no non-whitespace
+answer and no tool call gets one request-local continuation reminder. The model
+chooses whether to answer or use an available tool; reasoning text is never
+inspected to infer or execute a tool. Existing generated-token and context limits
+still apply. Explicit client stop, disconnect, and shutdown never trigger this
+continuation. Streaming text and cursors are retained so previous reasoning is
+not replayed when the continuation starts.
+
+If the response remains empty, or its output budget is exhausted before an
+answer, return an OpenAI-compatible SSE error / HTTP 502 rather than a successful
+blank answer. Other model families and API protocols keep their current behavior.
+A short visible answer without a tool call is outside this empty-reply recovery.

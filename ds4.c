@@ -61348,7 +61348,10 @@ static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *
     while (bytes != 0) {
         const size_t n = bytes > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
         if (fwrite(p, 1, n, fp) != n) {
-            payload_set_err(err, errlen, "failed to write session payload");
+            const int saved_errno = errno;
+            if (err && errlen) snprintf(err, errlen,
+                "failed to write session payload: %s (errno=%d)",
+                saved_errno ? strerror(saved_errno) : "short write", saved_errno);
             return 1;
         }
         p += n;
@@ -63169,7 +63172,10 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
     }
     int rc = payload_copy_file_bytes(src, fp, payload->bytes, err, errlen);
     if (fclose(src) != 0 && rc == 0) {
-        payload_set_err(err, errlen, "failed to close staged session payload");
+        const int saved_errno = errno;
+        if (err && errlen) snprintf(err, errlen,
+            "failed to close staged session payload: %s (errno=%d)",
+            saved_errno ? strerror(saved_errno) : "I/O failure", saved_errno);
         return 1;
     }
     return rc;
@@ -63199,7 +63205,10 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
     char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
     int fd = mkstemp(tmpl);
     if (fd < 0) {
-        payload_set_err(err, errlen, "failed to create staged session payload");
+        const int saved_errno = errno;
+        if (err && errlen) snprintf(err, errlen,
+            "failed to create staged session payload: %s (errno=%d)",
+            saved_errno ? strerror(saved_errno) : "I/O failure", saved_errno);
         return 1;
     }
     FILE *fp = fdopen(fd, "wb");
@@ -63214,7 +63223,10 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 
     int rc = ds4_session_save_payload(s, fp, err, errlen);
     if (rc == 0 && fflush(fp) != 0) {
-        payload_set_err(err, errlen, "failed to flush staged session payload");
+        const int saved_errno = errno;
+        if (err && errlen) snprintf(err, errlen,
+            "failed to flush staged session payload: %s (errno=%d)",
+            saved_errno ? strerror(saved_errno) : "I/O failure", saved_errno);
         rc = 1;
     }
     off_t pos = -1;
@@ -63226,7 +63238,10 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         }
     }
     if (fclose(fp) != 0 && rc == 0) {
-        payload_set_err(err, errlen, "failed to close staged session payload");
+        const int saved_errno = errno;
+        if (err && errlen) snprintf(err, errlen,
+            "failed to close staged session payload: %s (errno=%d)",
+            saved_errno ? strerror(saved_errno) : "I/O failure", saved_errno);
         rc = 1;
     }
     if (rc != 0) {

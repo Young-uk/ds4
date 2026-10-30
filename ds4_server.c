@@ -3575,6 +3575,33 @@ static bool qwen_has_tools_update(const chat_msgs *msgs) {
     return false;
 }
 
+/* Keep v1 text immutable: changing it would rewrite recorded prompt prefixes.
+ * Future policy changes need a new marker/version at a new user-turn boundary. */
+static bool qwen_tool_preamble_event(const chat_msg *m) {
+    return m && m->role && role_is_system(m->role) && m->content &&
+        !strcmp(m->content, "atomic-tool-preamble:v1");
+}
+
+static void append_qwen_tool_preamble_policy(buf *out) {
+    buf_puts(out, "<|im_start|>system\n"
+        "Keep the user involved in the work by communicating your developing assessment at meaningful decision points. "
+        "When you have worked out that the next step depends on checking information or taking an action, "
+        "share the useful assessment you have reached so far and what you now need to establish, then continue the work. "
+        "The earlier catalog instruction to ONLY reply in the function-call format applies to the XML call block, "
+        "not to the user-facing part of your response. It must not suppress your developing assessment. "
+        "Make that assessment visible assistant content outside <think>, before the relevant tool call; "
+        "do not leave it only in private reasoning and jump directly to a tool. "
+        "Let the task, uncertainty, and conversation determine what to say and how much to say. "
+        "There is no fixed phrase, sentence count, or announcement template. "
+        "Do not mechanically narrate every tool call or repeat an update for a step you have already explained. "
+        "When you can answer directly, answer naturally without inventing a waiting stage or unnecessary check. "
+        "Use the user's language. Share user-facing conclusions and uncertainty, not private chain-of-thought. "
+        "Distinguish your current assessment from verified findings, and do not claim an action has succeeded before its result arrives. "
+        "An update does not require a new permission question; preserve existing approval requirements. "
+        "Any tool-call block must still use the required tool syntax."
+        "<|im_end|>\n");
+}
+
 static void append_qwen_tools_update(buf *out, const char *json) {
     buf schemas = {0};
     const char *p = json;
@@ -3681,6 +3708,11 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
     }
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        if (qwen_tool_preamble_event(m)) {
+            if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
+            append_qwen_tool_preamble_policy(out);
+            continue;
+        }
         const char *tools_update = qwen_tools_update(m);
         if (tools_update) {
             if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
@@ -3738,7 +3770,7 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         ds4_think_mode update;
-        if (!role_is_system(m->role) || qwen_effort_update(m, &update) || qwen_tools_update(m)) continue;
+        if (!role_is_system(m->role) || qwen_effort_update(m, &update) || qwen_tools_update(m) || qwen_tool_preamble_event(m)) continue;
         if (system.len) buf_puts(&system, "\n\n");
         append_trimmed_text(&system, m->content);
     }
@@ -13052,6 +13084,34 @@ static int server_decode_budget(int requested, int generated, int room) {
     return remaining < room ? remaining : room;
 }
 
+static bool empty_qwen_chat_reply(const request *r, const char *content,
+                                   int tool_count) {
+    if (!r || r->kind != REQ_CHAT || r->api != API_OPENAI ||
+        r->model_syntax != SERVER_MODEL_SYNTAX_QWEN || tool_count > 0) return false;
+    for (const unsigned char *p = (const unsigned char *)(content ? content : ""); *p; p++) {
+        if (!isspace(*p)) return false;
+    }
+    return true;
+}
+
+static bool can_continue_empty_reply(bool attempted, const char *finish,
+                                       bool client_stop, bool cancelled,
+                                       bool stopping, int generated, int limit) {
+    return !attempted && finish && !strcmp(finish, "stop") &&
+           !client_stop && !cancelled && !stopping && generated < limit;
+}
+
+static const char *empty_reply_continuation_suffix(void) {
+    /* Do not infer a tool call from private reasoning. The model still chooses
+     * whether to answer or call a supplied tool. This reminder is request-local. */
+    return "<|im_end|>\n<|im_start|>system\n"
+           "The previous attempt ended without a user-visible answer or a tool call. "
+           "Continue the unfinished response now: provide the answer, or issue an "
+           "appropriate available tool call if one is needed. Do not end with only "
+           "private reasoning and do not start another thinking block.\n"
+           "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+}
+
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
@@ -13341,16 +13401,40 @@ static char *build_thinking_visible_text(const request *r,
     return buf_take(&visible);
 }
 
+/* Disk keys must describe the next client's rendered transcript, not sampled
+ * token text: Qwen's template trims reasoning and inserts its own separators.
+ * Preserve reasoning when the client echoes it, without changing the KV payload
+ * or weakening exact prefix matching for edited conversations. */
+static char *build_thinking_replay_text(const request *r, const char *content,
+                                        const char *reasoning) {
+    if (!r || r->model_syntax != SERVER_MODEL_SYNTAX_QWEN) {
+        return build_thinking_visible_text(r, content);
+    }
+    if (!r->prompt_text || !ds4_think_mode_enabled(r->think_mode)) return NULL;
+    const char *generation = "<|im_start|>assistant\n<think>\n";
+    size_t plen = strlen(r->prompt_text), glen = strlen(generation);
+    if (plen < glen || memcmp(r->prompt_text + plen - glen, generation, glen)) return NULL;
+    buf replay = {0};
+    buf_append(&replay, r->prompt_text, plen - glen);
+    chat_msg assistant = {0};
+    assistant.content = (char *)(content ? content : "");
+    assistant.reasoning = (char *)(r->prompt_echoes_reasoning && reasoning ? reasoning : "");
+    append_qwen_assistant_message(&replay, &assistant, &r->tool_orders);
+    return buf_take(&replay);
+}
+
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
+                                         const char *reasoning,
                                          bool visible_continuation) {
-    char *visible = build_thinking_visible_text(&j->req, content);
+    char *visible = build_thinking_replay_text(&j->req, content, reasoning);
     if (!visible) return;
 
     thinking_live_remember(s, slot, visible, &j->req);
     pthread_mutex_lock(&s->tool_mu);
     slot->thinking_live.token_text_disk_key =
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_QWEN &&
         j->req.prompt_preserves_reasoning && !visible_continuation;
     pthread_mutex_unlock(&s->tool_mu);
     server_log(DS4_LOG_KVCACHE,
@@ -14409,6 +14493,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     bool dsml_recovery_attempted = false;
+    bool empty_reply_recovery_attempted = false;
     int recovery_completion = 0;
     uint64_t rng = j->req.seed;
     if (!rng && !random_bytes(&rng, sizeof(rng))) {
@@ -14447,6 +14532,7 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
 
+resume_empty_reply:
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
@@ -15055,6 +15141,54 @@ decode_again:
         ds4_tokens_free(&effective_prompt);
         return;
     }
+    if (!g_stop_requested && !client_stop &&
+        (!strcmp(final_finish, "stop") || !strcmp(final_finish, "length")) &&
+        empty_qwen_chat_reply(&j->req, parsed_content, parsed_calls.len)) {
+        if (can_continue_empty_reply(empty_reply_recovery_attempted, final_finish,
+                client_stop, job_cancelled(j), g_stop_requested, completion, max_tokens)) {
+            empty_reply_recovery_attempted = true;
+            int appended = 0;
+            char recovery_err[160] = {0};
+            if (append_rendered_suffix_to_live_session(s, slot,
+                    empty_reply_continuation_suffix(), &appended,
+                    recovery_err, sizeof(recovery_err))) {
+                server_log(DS4_LOG_DEFAULT,
+                    "[generation-diag] id=%llu slot=%d empty_reply_continuation=1 generated=%d appended=%d",
+                    (unsigned long long)diagnostic_id, slot->id, completion, appended);
+                free(parsed_content);
+                free(parsed_reasoning);
+                tool_calls_free(&parsed_calls);
+                /* Retain the text buffer and streaming cursors: already-sent
+                 * reasoning must not be repeated, and the new answer/tool call
+                 * must remain in the same streamed assistant message. */
+                thinking.inside = false;
+                tool_scan_waiting_for_think_close = false;
+                finish = "length";
+                stop_detail = "output limit";
+                stop_token = -1;
+                goto resume_empty_reply;
+            }
+        }
+        const char *message = "The model ended without an answer or tool call. Please retry.";
+        server_log(DS4_LOG_WARNING,
+            "[generation-diag] id=%llu slot=%d empty_reply_failed=1 retried=%d generated=%d finish=%s",
+            (unsigned long long)diagnostic_id, slot->id,
+            empty_reply_recovery_attempted ? 1 : 0, completion + recovery_completion, final_finish);
+        if (!job_cancelled(j)) {
+            if (j->req.stream) sse_error_event(j->fd, &j->req, message);
+            else http_error(j->fd, s->enable_cors, 502, message);
+        }
+        request_live_state_clear(s, slot);
+        free(parsed_content);
+        free(parsed_reasoning);
+        tool_calls_free(&parsed_calls);
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
+    }
     log_tool_calls_summary(ctx_span, &parsed_calls,
                            responses_protocol);
 
@@ -15142,6 +15276,7 @@ decode_again:
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
+                                     parsed_reasoning,
                                      thinking_live_continuation ||
                                      (disk_cache_ext_flags & KV_EXT_THINKING_VISIBLE));
     } else if (!parsed_calls.len) {
@@ -19043,6 +19178,33 @@ static void test_qwen_append_only_tools(void) {
     free(before); free(after); free(same); chat_msgs_free(&msgs);
 }
 
+static void test_qwen_prospective_tool_preamble(void) {
+    chat_msgs msgs = {0};
+    append_effort_test_message(&msgs, "system", ATOMIC_EFFORT_MARKER "low");
+    append_effort_test_message(&msgs, "system", ATOMIC_TOOLS_MARKER "[]");
+    append_effort_test_message(&msgs, "user", "Legacy question.");
+    append_effort_test_message(&msgs, "assistant", "Legacy answer.");
+    char *before = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    append_effort_test_message(&msgs, "system", "atomic-tool-preamble:v1");
+    append_effort_test_message(&msgs, "user", "Check a source.");
+    char *after = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(!strncmp(before, after, strlen(before)));
+    TEST_ASSERT(strstr(after + strlen(before), "communicating your developing assessment at meaningful decision points") != NULL);
+    TEST_ASSERT(strstr(after, "atomic-tool-preamble:v1") == NULL);
+    chat_msg spoof = {.role = "user", .content = "atomic-tool-preamble:v1"};
+    TEST_ASSERT(!qwen_tool_preamble_event(&spoof));
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_qwen_generated_message_ex(
+        "I should check a source.</think>I'll check the source.\n\n<tool_call>\n<function=lookup>\n<parameter=query>\nexample\n</parameter>\n</function>\n</tool_call>",
+        true, &content, &reasoning, &calls, NULL));
+    TEST_ASSERT(content && !strcmp(content, "I'll check the source."));
+    TEST_ASSERT(reasoning && strstr(reasoning, "I should check a source."));
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "lookup"));
+    free(content); free(reasoning); tool_calls_free(&calls);
+    free(before); free(after); chat_msgs_free(&msgs);
+}
+
 static void test_qwen_reasoning_effort_levels(void) {
     bool enabled = true, got = false;
     ds4_think_mode mode = DS4_THINK_HIGH;
@@ -22053,6 +22215,31 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_empty_qwen_reply_gate(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    TEST_ASSERT(empty_qwen_chat_reply(&r, NULL, 0));
+    TEST_ASSERT(empty_qwen_chat_reply(&r, " \n\t", 0));
+    TEST_ASSERT(!empty_qwen_chat_reply(&r, "answer", 0));
+    TEST_ASSERT(!empty_qwen_chat_reply(&r, "", 1));
+    r.api = API_RESPONSES;
+    TEST_ASSERT(!empty_qwen_chat_reply(&r, "", 0));
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    TEST_ASSERT(!empty_qwen_chat_reply(&r, "", 0));
+    TEST_ASSERT(strstr(empty_reply_continuation_suffix(), "appropriate available tool call") != NULL);
+    TEST_ASSERT(can_continue_empty_reply(false, "stop", false, false, false, 35, 512));
+    TEST_ASSERT(!can_continue_empty_reply(true, "stop", false, false, false, 35, 512));
+    TEST_ASSERT(!can_continue_empty_reply(false, "length", false, false, false, 35, 512));
+    TEST_ASSERT(!can_continue_empty_reply(false, "stop", true, false, false, 35, 512));
+    TEST_ASSERT(!can_continue_empty_reply(false, "stop", false, true, false, 35, 512));
+    TEST_ASSERT(!can_continue_empty_reply(false, "stop", false, false, true, 35, 512));
+    TEST_ASSERT(!can_continue_empty_reply(false, "stop", false, false, false, 512, 512));
+    request_free(&r);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -23086,6 +23273,50 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_free(&history_msgs);
 }
 
+static void test_qwen_disk_replay_key_preserves_echoed_reasoning(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("question")};
+    chat_msgs_push(&msgs, user);
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_echoes_reasoning = true;
+    r.prompt_preserves_reasoning = true;
+    r.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+    const char *reasoning = "\n  checked assumptions  \n";
+    const char *content = "  answer with trailing whitespace \n";
+    char *key = build_thinking_replay_text(&r, content, reasoning);
+    TEST_ASSERT(key != NULL);
+    chat_msg assistant = {.role = xstrdup("assistant"),
+        .content = xstrdup(content), .reasoning = xstrdup(reasoning)};
+    chat_msgs_push(&msgs, assistant);
+    chat_msg next = {.role = xstrdup("user"), .content = xstrdup("continue")};
+    chat_msgs_push(&msgs, next);
+    char *future = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+    TEST_ASSERT(strlen(future) > strlen(key));
+    TEST_ASSERT(!memcmp(future, key, strlen(key)));
+    TEST_ASSERT(strstr(key, "checked assumptions") != NULL);
+    free(msgs.v[1].reasoning);
+    msgs.v[1].reasoning = xstrdup("edited reasoning");
+    char *edited = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+    TEST_ASSERT(strlen(edited) < strlen(key) || memcmp(edited, key, strlen(key)) != 0);
+    free(edited);
+    free(future);
+    free(key);
+    r.prompt_echoes_reasoning = false;
+    free(msgs.v[1].reasoning);
+    msgs.v[1].reasoning = xstrdup("");
+    key = build_thinking_replay_text(&r, content, reasoning);
+    future = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+    TEST_ASSERT(key && !memcmp(future, key, strlen(key)));
+    TEST_ASSERT(strstr(key, "checked assumptions") == NULL);
+    free(key);
+    free(future);
+    request_free(&r);
+    chat_msgs_free(&msgs);
+}
+
 static void test_thinking_canonical_empty_content(void) {
     /* Edge case: model thinks but produces empty content (e.g. tool-less
      * thinking where answer is entirely in reasoning).  Canonical should
@@ -23797,6 +24028,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_reasoning_effort_levels();
     test_qwen_append_only_effort();
     test_qwen_append_only_tools();
+    test_qwen_prospective_tool_preamble();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_glm_tool_calls_render_matches_template();
@@ -23873,6 +24105,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_tool_map_restores_before_prompt_render();
     test_kv_qwen_tool_map_restart();
     test_thinking_checkpoint_canonical_matches_future_prompt();
+    test_qwen_disk_replay_key_preserves_echoed_reasoning();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
@@ -23903,6 +24136,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_running_job_keeps_worker_ownership();
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_empty_qwen_reply_gate();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
