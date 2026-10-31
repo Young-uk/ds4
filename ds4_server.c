@@ -812,6 +812,8 @@ typedef struct {
     size_t image_count;
     char *model;
     bool model_from_request;
+    /* App-owned background summaries never replace the foreground checkpoint. */
+    bool atomic_summary;
     stop_list stops;
     char *raw_body;
     char *prompt_text;
@@ -3579,7 +3581,8 @@ static bool qwen_has_tools_update(const chat_msgs *msgs) {
  * Future policy changes need a new marker/version at a new user-turn boundary. */
 static bool qwen_tool_preamble_event(const chat_msg *m) {
     return m && m->role && role_is_system(m->role) && m->content &&
-        !strcmp(m->content, "atomic-tool-preamble:v1");
+        (!strcmp(m->content, "atomic-tool-preamble:v1") ||
+         !strcmp(m->content, "atomic-tool-preamble:v2"));
 }
 
 static void append_qwen_tool_preamble_policy(buf *out) {
@@ -3599,6 +3602,21 @@ static void append_qwen_tool_preamble_policy(buf *out) {
         "Distinguish your current assessment from verified findings, and do not claim an action has succeeded before its result arrives. "
         "An update does not require a new permission question; preserve existing approval requirements. "
         "Any tool-call block must still use the required tool syntax."
+        "<|im_end|>\n");
+}
+
+/* A new event leaves the text of recorded v1 histories immutable. Natural
+ * updates are useful progress, but are not a completed tool-dependent task. */
+static void append_qwen_tool_preamble_v2(buf *out) {
+    buf_puts(out, "<|im_start|>system\n"
+        "Continue applying the earlier natural progress-update policy. "
+        "When your visible response describes work you still need to do, it is an interim update, not the final answer. "
+        "If you decide to check information with an available tool, emit its actual tool call in this same assistant turn after the update. "
+        "Do not stop the turn after saying you will check, search, fetch, calculate, or inspect something. "
+        "After the tool result, complete the user's request using the evidence, or clearly explain a real blocker. "
+        "Do not claim that a tool ran without a tool result. Do not invent tool calls or use private reasoning as evidence. "
+        "Direct answers need no tool, no waiting announcement, and no permission question unless approval is actually required. "
+        "Keep the wording natural to the conversation; there is no fixed phrase or sentence count."
         "<|im_end|>\n");
 }
 
@@ -3711,6 +3729,7 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
         if (qwen_tool_preamble_event(m)) {
             if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
             append_qwen_tool_preamble_policy(out);
+            if (!strcmp(m->content, "atomic-tool-preamble:v2")) append_qwen_tool_preamble_v2(out);
             continue;
         }
         const char *tools_update = qwen_tools_update(m);
@@ -4368,6 +4387,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "atomic_summary")) {
+            if (!json_bool(&p, &r->atomic_summary)) { free(key); goto bad; }
         } else if (!strcmp(key, "model")) {
             if (!json_string_replace(&p, &r->model)) {
                 free(key);
@@ -10379,6 +10400,7 @@ struct server {
     int slot_count;
     int ctx_size;
     bool batched_mode;
+    bool dedicated_summary_slot;
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
@@ -11541,6 +11563,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
     if (!s || !slot) return false;
+    /* Summaries are disposable computation, not conversation checkpoints. */
+    if (s->dedicated_summary_slot && slot->id == s->slot_count - 1) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -12338,8 +12362,26 @@ static const char *diagnostic_tail_class(const char *a, size_t an,
     return "whitespace-only-prefix";
 }
 
+/* Structural regions only: never write conversation text, reasoning, or raw
+ * differing bytes to logs. This distinguishes a rewritten message boundary
+ * from a changed answer without relaxing any exact-match cache checks. */
+static const char *diagnostic_tail_region(const char *text, size_t length, size_t offset) {
+    static const char *tags[] = {"<|im_start|>system\n", "<|im_start|>user\n",
+        "<|im_start|>assistant\n", "<think>", "</think>", "<tool_call>", "<tool_response>"};
+    static const char *names[] = {"system", "user", "assistant", "reasoning", "answer", "tool-call", "tool-result"};
+    const char *region = "text";
+    for (size_t i = 0; i < length && i <= offset; i++) {
+        for (size_t k = 0; k < sizeof(tags) / sizeof(tags[0]); k++) {
+            const size_t n = strlen(tags[k]);
+            if (n <= length - i && !memcmp(text + i, tags[k], n)) region = names[k];
+        }
+    }
+    return region;
+}
+
 typedef struct {
     const char *classification;
+    const char *live_region, *prompt_region;
     int start, live_count, prompt_count;
     bool complete;
     size_t live_bytes, prompt_bytes, common_bytes;
@@ -12347,7 +12389,7 @@ typedef struct {
 
 static diagnostic_tail capture_diagnostic_tail(ds4_engine *engine,
         const ds4_tokens *live, const ds4_tokens *prompt, int old, int common) {
-    diagnostic_tail d = {.classification = "not-needed"};
+    diagnostic_tail d = {.classification = "not-needed", .live_region = "none", .prompt_region = "none"};
     if (!live || old <= 0 || common >= old) return d;
     d.start = common > 8 ? common - 8 : 0;
     int available = live->len < old ? live->len : old;
@@ -12368,6 +12410,8 @@ static diagnostic_tail capture_diagnostic_tail(ds4_engine *engine,
         while (d.common_bytes < d.live_bytes && d.common_bytes < d.prompt_bytes &&
                at[d.common_bytes] == bt[d.common_bytes]) d.common_bytes++;
         d.classification = diagnostic_tail_class(at, d.live_bytes, bt, d.prompt_bytes, d.complete);
+        d.live_region = diagnostic_tail_region(at, d.live_bytes, d.common_bytes);
+        d.prompt_region = diagnostic_tail_region(bt, d.prompt_bytes, d.common_bytes);
     } else d.classification = "unavailable";
     free(at); free(bt);
     return d;
@@ -12823,11 +12867,32 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
 
 static int server_next_prefill_slot_locked(const server *s) {
     if (!s || s->slot_count <= 0) return -1;
+    /* Existing model-executor queue gives chat prefill the next quantum.
+     * Running GPU work is not interrupted; no additional mutex is needed. */
+    if (s->dedicated_summary_slot && s->slots[0].prefill_waiting) return 0;
     for (int n = 1; n <= s->slot_count; n++) {
         int id = (s->last_prefill_slot + n) % s->slot_count;
         if (s->slots[id].prefill_waiting) return id;
     }
     return -1;
+}
+
+/* The summary owns a small KV cache, never another full conversation cache. */
+#define ATOMIC_SUMMARY_CONTEXT 8192
+
+static int request_context_limit(const server *s, const request *r) {
+    return s->dedicated_summary_slot && r->atomic_summary
+        ? ATOMIC_SUMMARY_CONTEXT : s->ctx_size;
+}
+
+static bool summary_decode_must_yield(const server *s, int slot_id) {
+    return s->dedicated_summary_slot && slot_id > 0 &&
+        (s->slots[0].decode_pending || s->slots[0].prefill_waiting);
+}
+
+static bool server_prefill_waits_for_decode(const server *s, const server_slot *slot) {
+    // A queued summary token must not starve a newly arrived chat prompt.
+    return !(s->dedicated_summary_slot && slot->id == 0);
 }
 
 static bool server_prefill_enter(server *s, server_slot *slot) {
@@ -12845,7 +12910,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
-           (s->model_busy || s->decode_pending > 0 ||
+           (s->model_busy || (s->decode_pending > 0 && server_prefill_waits_for_decode(s, slot)) ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
@@ -12915,6 +12980,8 @@ static int server_session_sync(server *s, server_slot *slot,
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
+        // Keep background GPU work bounded even before a foreground job arrives.
+        if (s->dedicated_summary_slot && slot->id == s->slot_count - 1 && quantum > 512) quantum = 512;
         int target = done + quantum;
         if (target > prompt->len || target < done) target = prompt->len;
         if (target <= 0) target = prompt->len;
@@ -13842,7 +13909,8 @@ static void *decode_worker_main(void *arg) {
             }
         }
 
-        while (s->model_busy) {
+        while (s->model_busy ||
+               (s->dedicated_summary_slot && s->slots[0].prefill_waiting)) {
             pthread_cond_wait(&s->model_cv, &s->model_mu);
         }
         if (s->model_stopping && s->decode_pending == 0) break;
@@ -13853,6 +13921,10 @@ static void *decode_worker_main(void *arg) {
             for (int i = 0; i < s->slot_count; i++) {
                 server_slot *slot = &s->slots[i];
                 if (!slot->decode_pending || slot->decode_speculative != (bool)speculative) continue;
+                /* Never combine foreground speculation and background decode.
+                 * Foreground work wins at the next GPU scheduling boundary. */
+                if (summary_decode_must_yield(s, i) ||
+                    (s->dedicated_summary_slot && count > 0)) continue;
                 slot->decode_pending = false;
                 slot->decode_in_flight = true;
                 s->decode_pending--;
@@ -14200,10 +14272,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                           slot->id, cached, prompt_tokens, disk_cached, cache_source);
     buf_printf(&diagnostic, " tail_class=%s tail_start=%d tail_live_tokens=%d "
         "tail_prompt_tokens=%d tail_complete=%d tail_live_bytes=%zu "
-        "tail_prompt_bytes=%zu tail_common_bytes=%zu",
+        "tail_prompt_bytes=%zu tail_common_bytes=%zu tail_live_region=%s tail_prompt_region=%s",
         tail_diag.classification, tail_diag.start, tail_diag.live_count,
         tail_diag.prompt_count, tail_diag.complete, tail_diag.live_bytes,
-        tail_diag.prompt_bytes, tail_diag.common_bytes);
+        tail_diag.prompt_bytes, tail_diag.common_bytes, tail_diag.live_region, tail_diag.prompt_region);
     server_log(DS4_LOG_DEFAULT, "%s", diagnostic.ptr);
     buf_free(&diagnostic);
     const double t0 = now_sec();
@@ -14607,7 +14679,7 @@ resume_empty_reply:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
+        } else if (s->batched_mode && s->qwen4_batch_mtp && !j->req.atomic_summary &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -15451,6 +15523,9 @@ static bool live_state_contains_all(const live_tool_state *state,
 static int job_required_slot_locked(server *s, const job *j) {
     if (!s || !j) return -1;
     const request *r = &j->req;
+    if (s->dedicated_summary_slot && s->slot_count > 1) {
+        return r->atomic_summary ? s->slot_count - 1 : 0;
+    }
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (r->responses_requires_live_tool_state &&
@@ -15815,7 +15890,8 @@ static bool send_model(server *s, int fd, const char *id) {
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
+    buf_printf(&b, "{\"object\":\"list\",\"atomic_summary_slot\":%s,\"data\":[",
+               s->dedicated_summary_slot && s->slot_count > 1 ? "true" : "false");
     if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
@@ -16013,8 +16089,9 @@ static void *client_main(void *arg) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
-    if (request_exceeds_context(&req, ctx_size)) {
-        http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
+    const int request_limit = request_context_limit(s, &req);
+    if (request_exceeds_context(&req, request_limit)) {
+        http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, request_limit);
         request_free(&req);
         goto done;
     }
@@ -16106,6 +16183,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    bool dedicated_summary_slot;
     int mixed_prefill_quantum;
 } server_config;
 
@@ -16347,6 +16425,9 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--summary-slot")) {
+            c.dedicated_summary_slot = true;
+            c.batched_sessions = 2;
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
@@ -16616,6 +16697,7 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.dedicated_summary_slot = cfg.dedicated_summary_slot;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
@@ -16649,7 +16731,9 @@ int main(int argc, char **argv) {
         server_slot *slot = &s.slots[i];
         slot->srv = &s;
         slot->id = i;
-        if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
+        if (ds4_session_create(&slot->session, engine,
+                cfg.dedicated_summary_slot && i == s.slot_count - 1
+                    ? ATOMIC_SUMMARY_CONTEXT : cfg.ctx_size) != 0) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: failed to create %s session %d/%d",
                        ds4_backend_name(cfg.engine.backend), i + 1, slot_count);
@@ -16824,6 +16908,33 @@ static void test_server_bind_slot(server *s, server_slot *slot) {
     slot->id = 0;
     s->slots = slot;
     s->slot_count = 1;
+}
+
+static void test_summary_slot_routing(void) {
+    server_slot slots[2] = {{0}};
+    server s = {.slots = slots, .slot_count = 2, .dedicated_summary_slot = true};
+    job j = {0};
+    slots[0].id = 0; slots[1].id = 1;
+    s.ctx_size = 65536;
+    TEST_ASSERT(request_context_limit(&s, &j.req) == 65536);
+    j.req.atomic_summary = true;
+    TEST_ASSERT(request_context_limit(&s, &j.req) == 8192);
+    j.req.atomic_summary = false;
+    slots[0].decode_pending = true;
+    TEST_ASSERT(summary_decode_must_yield(&s, 1));
+    TEST_ASSERT(!summary_decode_must_yield(&s, 0));
+    slots[0].decode_pending = false;
+    TEST_ASSERT(!summary_decode_must_yield(&s, 1));
+    TEST_ASSERT(!server_prefill_waits_for_decode(&s, &slots[0]));
+    TEST_ASSERT(server_prefill_waits_for_decode(&s, &slots[1]));
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 0);
+    j.req.atomic_summary = true;
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
+    slots[0].prefill_waiting = slots[1].prefill_waiting = true;
+    s.last_prefill_slot = 0;
+    TEST_ASSERT(server_next_prefill_slot_locked(&s) == 0);
+    slots[0].prefill_waiting = false;
+    TEST_ASSERT(server_next_prefill_slot_locked(&s) == 1);
 }
 
 static void test_batched_prefill_round_robin(void) {
@@ -19191,6 +19302,11 @@ static void test_qwen_prospective_tool_preamble(void) {
     TEST_ASSERT(!strncmp(before, after, strlen(before)));
     TEST_ASSERT(strstr(after + strlen(before), "communicating your developing assessment at meaningful decision points") != NULL);
     TEST_ASSERT(strstr(after, "atomic-tool-preamble:v1") == NULL);
+    buf v2 = {0};
+    append_qwen_tool_preamble_v2(&v2);
+    TEST_ASSERT(strstr(v2.ptr, "actual tool call in this same assistant turn") != NULL);
+    TEST_ASSERT(strstr(v2.ptr, "no fixed phrase") != NULL);
+    buf_free(&v2);
     chat_msg spoof = {.role = "user", .content = "atomic-tool-preamble:v1"};
     TEST_ASSERT(!qwen_tool_preamble_event(&spoof));
     char *content = NULL, *reasoning = NULL;
@@ -23937,6 +24053,8 @@ static void test_cache_diagnostics_are_metadata_only(void) {
 
 static void ds4_server_unit_tests_run(void) {
     TEST_ASSERT(!strcmp(diagnostic_tail_class("abc", 3, "abcdef", 6, true), "same-decoded-prefix"));
+    TEST_ASSERT(!strcmp(diagnostic_tail_region("<|im_start|>assistant\n<think>secret</think>answer", strlen("<|im_start|>assistant\n<think>secret</think>answer"), 40), "answer"));
+    TEST_ASSERT(!strcmp(diagnostic_tail_region("private data", 12, 3), "text"));
     TEST_ASSERT(!strcmp(diagnostic_tail_class("a\n b", 4, "a b next", 8, true), "whitespace-only-prefix"));
     TEST_ASSERT(!strcmp(diagnostic_tail_class("abc", 3, "axc", 3, true), "text-differs"));
     TEST_ASSERT(!strcmp(diagnostic_tail_class("abc", 3, "ab", 2, true), "text-differs"));
@@ -23991,6 +24109,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
     test_server_image_embedding_cache();
+    test_summary_slot_routing();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();

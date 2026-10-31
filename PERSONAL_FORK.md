@@ -143,3 +143,46 @@ If the response remains empty, or its output budget is exhausted before an
 answer, return an OpenAI-compatible SSE error / HTTP 502 rather than a successful
 blank answer. Other model families and API protocols keep their current behavior.
 A short visible answer without a tool call is outside this empty-reply recovery.
+
+### Dedicated background summary session
+
+`--summary-slot` enables two resident sessions sharing model weights and supported
+prefill workspaces. OpenAI chat requests with `atomic_summary: true` use the last
+slot, while regular traffic stays on slot zero. The models list advertises
+`atomic_summary_slot` so clients can opt in without sending summaries to a
+single-session server. Foreground prefill wins the next available quantum;
+already executing GPU work is not preempted and decode throughput remains
+shared. Background prefill is bounded to 512 tokens per idle quantum and uses the
+existing smaller mixed-prefill quantum while foreground generation is active. Summary slot
+checkpoints never enter the conversation disk-cache budget.
+
+This changes request scheduling only in the explicit summary-slot mode. Normal
+single-session operation and ordinary multi-session routing remain unchanged.
+Synthetic concurrent streaming at 65,536 context verified chat completion before
+the summary completed, plus the app's archive/summary/restart/search state
+machine with an actual model summary. Token policy and archived-source integrity
+are tested separately; this does not guarantee a correct summary or zero latency.
+
+## Bounded summary slot experiment (2026-10-31)
+
+The opt-in `--summary-slot` experiment now allocates an 8192-token summary
+session alongside the configured foreground session. Oversized summary prompts
+are rejected with their actual token count and 8192 limit. Summary decode does
+not use MTP and never shares a decode batch with the foreground request.
+Foreground pending prefill/decode wins at the next scheduling boundary.
+The paired client folds bounded evidence fragments into a summary sequentially.
+Normal installed single-slot startup remains unchanged. This is not a claim
+that the long-context Metal memory peak or interactive latency is production-safe.
+
+## Tool follow-through and private cache diagnostics (2026-10-31)
+
+Recorded v1 progress-policy events remain byte-for-byte unchanged. A new v2
+user-turn event supplements them with same-turn actual tool-call follow-through,
+without a fixed announcement, keyword classifier, inferred tool execution, or
+new tool permissions. Direct answers remain direct. This is model guidance,
+not a guarantee that an arbitrary completion will choose a tool correctly.
+
+Tail-mismatch logs now report only approximate structural regions (system,
+user, assistant, reasoning, answer, tool-call/result). No differing conversation
+bytes, prompt text or reasoning content are logged. Matching and KV payloads
+are unchanged. Server-unit and live behavior checks are recorded separately.
