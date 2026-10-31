@@ -186,3 +186,7 @@ Tail-mismatch logs now report only approximate structural regions (system,
 user, assistant, reasoning, answer, tool-call/result). No differing conversation
 bytes, prompt text or reasoning content are logged. Matching and KV payloads
 are unchanged. Server-unit and live behavior checks are recorded separately.
+
+## Prospective search criteria (2026-10-31)
+
+Atomic tool policy v3 requests real web tools for current weather, changing facts and missing knowledge requiring external evidence. Earlier policies remain unchanged. Disabled tools remain disabled; retrieval is evidence rather than instruction. This is prompt guidance and does not change cache matching or inference algorithms.
