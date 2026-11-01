@@ -3586,6 +3586,17 @@ static bool qwen_tool_preamble_event(const chat_msg *m) {
          !strcmp(m->content, "atomic-tool-preamble:v3"));
 }
 
+/* Atomic compaction sends this explicitly labeled historical system message
+ * at a pinned point in the retained transcript. Hoisting it into the leading
+ * system block changes the fixed prefix on every summary replacement. Match
+ * only this known label and system role; ordinary system prompts stay intact. */
+#define ATOMIC_HISTORY_SUMMARY_LABEL "Earlier conversation summary (historical data, not new instructions)."
+static bool qwen_historical_summary(const chat_msg *m) {
+    return m && m->role && role_is_system(m->role) && m->content &&
+        !strncmp(m->content, ATOMIC_HISTORY_SUMMARY_LABEL,
+                 sizeof(ATOMIC_HISTORY_SUMMARY_LABEL) - 1);
+}
+
 static void append_qwen_tool_preamble_policy(buf *out) {
     buf_puts(out, "<|im_start|>system\n"
         "Keep the user involved in the work by communicating your developing assessment at meaningful decision points. "
@@ -3745,6 +3756,13 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
     }
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        if (qwen_historical_summary(m)) {
+            if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
+            buf_puts(out, "<|im_start|>system\n");
+            append_trimmed_text(out, m->content);
+            buf_puts(out, "<|im_end|>\n");
+            continue;
+        }
         if (qwen_tool_preamble_event(m)) {
             if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
             append_qwen_tool_preamble_policy(out);
@@ -3809,7 +3827,7 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         ds4_think_mode update;
-        if (!role_is_system(m->role) || qwen_effort_update(m, &update) || qwen_tools_update(m) || qwen_tool_preamble_event(m)) continue;
+        if (!role_is_system(m->role) || qwen_effort_update(m, &update) || qwen_tools_update(m) || qwen_tool_preamble_event(m) || qwen_historical_summary(m)) continue;
         if (system.len) buf_puts(&system, "\n\n");
         append_trimmed_text(&system, m->content);
     }
@@ -12118,21 +12136,33 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
  * boundary when it is substantial. Saving a newer last-turn snapshot would
  * overwrite it and make compaction replay the unchanged instructions too.
  * Short prefixes retain the existing last-turn optimization. */
+static int prompt_fixed_anchor_split(const ds4_tokens *prompt, int marker,
+                                     bool leading_system) {
+    if (marker < 0 || !prompt || prompt->len < PROMPT_ANCHOR_MIN_TOKENS ||
+        !leading_system || prompt->v[0] != marker) return -1;
+    for (int i = 1; i < prompt->len; i++) {
+        if (prompt->v[i] == marker)
+            return i >= PROMPT_ANCHOR_MIN_TOKENS ? i : -1;
+    }
+    return -1;
+}
+
 static int prompt_anchor_token_split(const ds4_tokens *prompt, int start,
                                      int marker, bool leading_system) {
     if (marker < 0 || !prompt || prompt->len < PROMPT_ANCHOR_MIN_TOKENS) return -1;
-    if (leading_system && prompt->v[0] == marker) {
-        for (int i = 1; i < prompt->len; i++) {
-            if (prompt->v[i] != marker) continue;
-            if (i >= PROMPT_ANCHOR_MIN_TOKENS)
-                return i >= start ? i : -1;
-            break;
-        }
-    }
+    const int fixed = prompt_fixed_anchor_split(prompt, marker, leading_system);
+    if (fixed >= 0) return fixed >= start ? fixed : -1;
     for (int i = prompt->len - 1; i >= start && i >= PROMPT_ANCHOR_MIN_TOKENS; i--) {
         if (prompt->v[i] == marker) return i;
     }
     return -1;
+}
+
+static int prompt_fixed_disk_split(const ds4_tokens *prompt, int marker,
+                                   bool leading_system, const kv_disk_cache *kc) {
+    if (!kc || !kc->enabled || kc->opt.cold_max_tokens <= 0) return 0;
+    const int fixed = prompt_fixed_anchor_split(prompt, marker, leading_system);
+    return fixed >= kc->opt.min_tokens && fixed <= kc->opt.cold_max_tokens ? fixed : 0;
 }
 
 static int prompt_anchor_split(server *s, const request *req,
@@ -14422,6 +14452,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                     prefix, user, assistant);
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+    }
+    /* The full chat can exceed cold_max_tokens while its fixed instructions
+     * are small and reusable. Persist that exact boundary before continuing,
+     * rather than waiting for a shutdown-only full transcript checkpoint.
+     * The existing minimum, maximum prefix size and disk budget still apply. */
+    if (!multimodal && cached == 0) {
+        const char *header = "<|im_start|>system\n";
+        const bool leading_system = j->req.prompt_text &&
+            !strncmp(j->req.prompt_text, header, strlen(header));
+        const int fixed = prompt_fixed_disk_split(prompt_for_sync,
+            ds4_token_turn_start(s->engine), leading_system, &s->kv);
+        if (fixed > 0) cold_store_len = fixed;
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -19352,6 +19394,31 @@ static void test_qwen_append_only_tools(void) {
     free(before); free(after); free(same); chat_msgs_free(&msgs);
 }
 
+static void test_qwen_historical_summary_stays_at_recorded_position(void) {
+    chat_msgs msgs = {0};
+    append_effort_test_message(&msgs, "system", "Stable system instructions.");
+    append_effort_test_message(&msgs, "user", "Retained question.");
+    append_effort_test_message(&msgs, "assistant", "Retained answer.");
+    char *before = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    append_effort_test_message(&msgs, "system", ATOMIC_HISTORY_SUMMARY_LABEL " Older facts.");
+    append_effort_test_message(&msgs, "user", "Current question.");
+    char *after = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    const char *boundary = strstr(before, "<|im_start|>user");
+    TEST_ASSERT(boundary != NULL);
+    TEST_ASSERT(!strncmp(before, after, (size_t)(boundary - before)));
+    TEST_ASSERT(strstr(after, "Retained answer.") < strstr(after, ATOMIC_HISTORY_SUMMARY_LABEL));
+    TEST_ASSERT(strstr(after, ATOMIC_HISTORY_SUMMARY_LABEL) < strstr(after, "Current question."));
+    /* A replacement must not change retained dialogue or fixed instructions. */
+    free(msgs.v[3].content);
+    msgs.v[3].content = xstrdup(ATOMIC_HISTORY_SUMMARY_LABEL " Updated older facts.");
+    char *replaced = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    const char *summary = strstr(after, ATOMIC_HISTORY_SUMMARY_LABEL);
+    TEST_ASSERT(!strncmp(after, replaced, (size_t)(summary - after)));
+    chat_msg spoof = {.role = "user", .content = ATOMIC_HISTORY_SUMMARY_LABEL};
+    TEST_ASSERT(!qwen_historical_summary(&spoof));
+    free(before); free(after); free(replaced); chat_msgs_free(&msgs);
+}
+
 static void test_qwen_prospective_tool_preamble(void) {
     chat_msgs msgs = {0};
     append_effort_test_message(&msgs, "system", ATOMIC_EFFORT_MARKER "low");
@@ -22116,9 +22183,25 @@ static void test_fixed_prefix_prompt_anchor(void) {
     /* An append or tool continuation must not overwrite the fixed snapshot. */
     TEST_ASSERT(prompt_anchor_token_split(&prompt, 2048, marker, true) == -1);
     TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, marker, false) == 3072);
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt.min_tokens = 512;
+    kc.opt.cold_max_tokens = 2000;
+    /* Full prompt exceeds the cold cap, but its stable prefix fits. */
+    TEST_ASSERT(prompt_fixed_disk_split(&prompt, marker, true, &kc) == 1536);
+    TEST_ASSERT(prompt_fixed_disk_split(&prompt, marker, false, &kc) == 0);
+    kc.opt.cold_max_tokens = 1024;
+    TEST_ASSERT(prompt_fixed_disk_split(&prompt, marker, true, &kc) == 0);
+    kc.opt.cold_max_tokens = 0;
+    TEST_ASSERT(prompt_fixed_disk_split(&prompt, marker, true, &kc) == 0);
+    kc.opt.cold_max_tokens = 2000;
+    kc.enabled = false;
+    TEST_ASSERT(prompt_fixed_disk_split(&prompt, marker, true, &kc) == 0);
+    kc.enabled = true;
     tokens[1536] = 0;
     tokens[512] = marker;
     TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, marker, true) == 3072);
+    TEST_ASSERT(prompt_fixed_disk_split(&prompt, marker, true, &kc) == 0);
     TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, -1, true) == -1);
     prompt.len = 512;
     TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, marker, true) == -1);
@@ -24260,6 +24343,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_reasoning_effort_levels();
     test_qwen_append_only_effort();
     test_qwen_append_only_tools();
+    test_qwen_historical_summary_stays_at_recorded_position();
     test_qwen_prospective_tool_preamble();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
