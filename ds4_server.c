@@ -13540,6 +13540,7 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
                                                const char *finish,
                                                bool inside_thinking,
                                                const char *content,
+                                               const char *reasoning,
                                                const tool_calls *calls) {
     if (!r || !calls || calls->len == 0) return NULL;
     if (r->kind != REQ_CHAT || r->image_count != 0) return NULL;
@@ -13550,11 +13551,27 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
     /* Use the decode finish, not the parser's promoted tool_calls status:
      * repaired/truncated output and unclosed reasoning are not this frontier. */
     if (!finish || strcmp(finish, "tool_calls") || inside_thinking) return NULL;
-    char *suffix = build_qwen_assistant_suffix(r, content, NULL, false, calls);
+    /* Render with the same separator rules as the next client request. In
+     * particular, raw tool text following nonempty reasoning already contains
+     * its own post-think whitespace. */
+    buf generation = {0};
+    append_qwen_generation_prompt(&generation, ds4_think_mode_enabled(r->think_mode));
+    size_t plen = strlen(r->prompt_text);
+    if (plen < generation.len ||
+        memcmp(r->prompt_text + plen - generation.len, generation.ptr, generation.len)) {
+        buf_free(&generation);
+        return NULL;
+    }
     buf visible = {0};
-    buf_puts(&visible, r->prompt_text);
-    buf_append(&visible, suffix, strlen(suffix) - strlen("<|im_end|>"));
-    free(suffix);
+    buf_append(&visible, r->prompt_text, plen - generation.len);
+    buf_free(&generation);
+    chat_msg assistant = {0};
+    assistant.content = (char *)(content ? content : "");
+    assistant.reasoning = (char *)(r->prompt_echoes_reasoning && reasoning ? reasoning : "");
+    assistant.calls = *calls;
+    append_qwen_assistant_message(&visible, &assistant, &r->tool_orders);
+    visible.len -= strlen("<|im_end|>\n");
+    visible.ptr[visible.len] = '\0';
     return buf_take(&visible);
 }
 
@@ -13563,9 +13580,10 @@ static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *s
                                                        const char *finish,
                                                        bool inside_thinking,
                                                        const char *content,
+                                                       const char *reasoning,
                                                        const tool_calls *calls) {
     char *visible = build_qwen_tool_turn_visible_text(&j->req, finish,
-                                                     inside_thinking, content, calls);
+                                                     inside_thinking, content, reasoning, calls);
     if (!visible) return false;
     thinking_live_remember(s, slot, visible, &j->req);
     /* The visible key renders this turn with an empty think block.  A client
@@ -13573,7 +13591,11 @@ static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *s
      * request never matches that key on disk: key the eviction store by the
      * sampled text instead, which is what such a client renders. */
     pthread_mutex_lock(&s->tool_mu);
-    slot->thinking_live.token_text_disk_key = j->req.prompt_echoes_reasoning;
+    /* A prior visible continuation can retain sampled whitespace that differs
+     * from the client's rendered history. Key this frontier by that rendered
+     * history even when reasoning is echoed; raw token text can no longer be
+     * assumed to describe the same prefix. */
+    slot->thinking_live.token_text_disk_key = false;
     pthread_mutex_unlock(&s->tool_mu);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
@@ -15360,7 +15382,7 @@ resume_empty_reply:
         if (!remember_qwen_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
                 parsed_content ? parsed_content : "",
-                &parsed_calls))
+                parsed_reasoning, &parsed_calls))
         {
             thinking_live_clear(s, slot);
         }
@@ -19403,19 +19425,19 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             assistant.calls.raw_tool_text = xstrdup(
                 "\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>");
             char *visible = build_qwen_tool_turn_visible_text(
-                &r, "tool_calls", false, assistant.content, &assistant.calls);
+                &r, "tool_calls", false, assistant.content, NULL, &assistant.calls);
             TEST_ASSERT(visible != NULL);
             TEST_ASSERT(build_qwen_tool_turn_visible_text(
-                &r, "length", false, assistant.content, &assistant.calls) == NULL);
+                &r, "length", false, assistant.content, NULL, &assistant.calls) == NULL);
             TEST_ASSERT(build_qwen_tool_turn_visible_text(
-                &r, "tool_calls", true, assistant.content, &assistant.calls) == NULL);
+                &r, "tool_calls", true, assistant.content, NULL, &assistant.calls) == NULL);
             r.image_count = 1;
             TEST_ASSERT(build_qwen_tool_turn_visible_text(
-                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+                &r, "tool_calls", false, assistant.content, NULL, &assistant.calls) == NULL);
             r.image_count = 0;
             r.api = API_RESPONSES;
             TEST_ASSERT(build_qwen_tool_turn_visible_text(
-                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+                &r, "tool_calls", false, assistant.content, NULL, &assistant.calls) == NULL);
             chat_msgs_push(&msgs, assistant);
             chat_msg tool = {0};
             tool.role = xstrdup("tool");
@@ -19434,6 +19456,24 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
                 msgs.v[1].reasoning = xstrdup("hidden reasoning");
                 char *with_reasoning = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
                 TEST_ASSERT(visible && strncmp(with_reasoning, visible, strlen(visible)) != 0);
+                /* A previous visible-prefix continuation may have different
+                 * sampled whitespace. The new tool key must use the request's
+                 * historical bytes plus the echoed, template-trimmed reasoning,
+                 * rather than the accumulated sampled token text. */
+                r.api = API_OPENAI;
+                r.prompt_echoes_reasoning = true;
+                char *echoed = build_qwen_tool_turn_visible_text(
+                    &r, "tool_calls", false, assistant.content,
+                    " \nhidden reasoning\n ", &assistant.calls);
+                TEST_ASSERT(echoed && !strncmp(with_reasoning, echoed, strlen(echoed)));
+                TEST_ASSERT(echoed && strstr(echoed, "hidden reasoning\n</think>") != NULL);
+                if (echoed) {
+                    char saved = with_reasoning[0];
+                    with_reasoning[0] = '!';
+                    TEST_ASSERT(strncmp(with_reasoning, echoed, strlen(echoed)) != 0);
+                    with_reasoning[0] = saved;
+                }
+                free(echoed);
                 free(with_reasoning);
             }
             free(next);
