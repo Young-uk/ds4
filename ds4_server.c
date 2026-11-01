@@ -12110,17 +12110,38 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
 /* Prompts shorter than this are cheap enough to replay. */
 #define PROMPT_ANCHOR_MIN_TOKENS 1024
 
-/* A Qwen3.8 prompt anchor sits on the last turn marker the prefill will
- * reach, just before the assistant header the client appended: whatever a
- * later request renders after it, the transcript up to it stays the same.
- * Returns -1 when the prompt has no marker past the prefill start. */
-static int prompt_anchor_split(server *s, const ds4_tokens *prompt, int start) {
-    const int marker = ds4_token_turn_start(s->engine);
+/* A Qwen3.8 prompt anchor sits on a turn marker the prefill will reach:
+ * preferably after substantial fixed instructions, otherwise just before
+ * the final assistant header. Matching bytes before it can be reused.
+ * Returns -1 when the chosen boundary is behind the live prefill start. */
+/* Keep the single recurrent-state snapshot at the fixed leading system
+ * boundary when it is substantial. Saving a newer last-turn snapshot would
+ * overwrite it and make compaction replay the unchanged instructions too.
+ * Short prefixes retain the existing last-turn optimization. */
+static int prompt_anchor_token_split(const ds4_tokens *prompt, int start,
+                                     int marker, bool leading_system) {
     if (marker < 0 || !prompt || prompt->len < PROMPT_ANCHOR_MIN_TOKENS) return -1;
+    if (leading_system && prompt->v[0] == marker) {
+        for (int i = 1; i < prompt->len; i++) {
+            if (prompt->v[i] != marker) continue;
+            if (i >= PROMPT_ANCHOR_MIN_TOKENS)
+                return i >= start ? i : -1;
+            break;
+        }
+    }
     for (int i = prompt->len - 1; i >= start && i >= PROMPT_ANCHOR_MIN_TOKENS; i--) {
         if (prompt->v[i] == marker) return i;
     }
     return -1;
+}
+
+static int prompt_anchor_split(server *s, const request *req,
+                                const ds4_tokens *prompt, int start) {
+    const char *header = "<|im_start|>system\n";
+    const bool leading_system = req->prompt_text &&
+        !strncmp(req->prompt_text, header, strlen(header));
+    return prompt_anchor_token_split(prompt, start,
+                                    ds4_token_turn_start(s->engine), leading_system);
 }
 
 /* Called with the session at prompt[0, pos).  The anchor text must be a byte
@@ -14458,7 +14479,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (ds4_session_common_prefix(slot->session, prompt_for_sync) != start) start = 0;
         const int held = ds4_session_anchor_pos(slot->session);
         pthread_mutex_unlock(&s->inference_mu);
-        const int split = prompt_anchor_split(s, prompt_for_sync, start);
+        const int split = prompt_anchor_split(s, &j->req, prompt_for_sync, start);
         if (split > start) {
             ds4_tokens head = *prompt_for_sync;
             head.len = split;
@@ -22081,6 +22102,28 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_fixed_prefix_prompt_anchor(void) {
+    int tokens[4096] = {0};
+    const int marker = 77;
+    ds4_tokens prompt = {0};
+    prompt.v = tokens;
+    prompt.len = 4096;
+    tokens[0] = marker;
+    tokens[1536] = marker;
+    tokens[3072] = marker;
+    TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, marker, true) == 1536);
+    TEST_ASSERT(prompt_anchor_token_split(&prompt, 1536, marker, true) == 1536);
+    /* An append or tool continuation must not overwrite the fixed snapshot. */
+    TEST_ASSERT(prompt_anchor_token_split(&prompt, 2048, marker, true) == -1);
+    TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, marker, false) == 3072);
+    tokens[1536] = 0;
+    tokens[512] = marker;
+    TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, marker, true) == 3072);
+    TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, -1, true) == -1);
+    prompt.len = 512;
+    TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, marker, true) == -1);
+}
+
 static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
@@ -24314,6 +24357,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_fixed_prefix_prompt_anchor();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();

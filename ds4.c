@@ -85838,7 +85838,7 @@ void ds4_session_invalidate(ds4_session *s) {
 
 /* Qwen3.8 cannot rewind its GDN layers, so a prompt that shares only part of
  * the live transcript would otherwise be replayed from token zero.  The server
- * saves the state at a prompt anchor (the last turn marker) before generation;
+ * saves the state at a prompt anchor (a fixed-prefix or last-turn marker) before generation;
  * a later request that agrees with the transcript up to the anchor restores
  * it and prefills only the rest. */
 bool ds4_session_anchor_save(ds4_session *s) {
