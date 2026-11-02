@@ -12962,7 +12962,7 @@ static int server_next_prefill_slot_locked(const server *s) {
 }
 
 /* The summary owns a small KV cache, never another full conversation cache. */
-#define ATOMIC_SUMMARY_CONTEXT 8192
+#define ATOMIC_SUMMARY_CONTEXT 16384
 
 static int request_context_limit(const server *s, const request *r) {
     return s->dedicated_summary_slot && r->atomic_summary
@@ -16008,7 +16008,7 @@ static bool send_model(server *s, int fd, const char *id) {
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    buf_printf(&b, "{\"object\":\"list\",\"atomic_summary_slot\":%s,\"atomic_completion_review\":true,\"data\":[",
+    buf_printf(&b, "{\"object\":\"list\",\"atomic_summary_slot\":%s,\"atomic_completion_review\":true,\"atomic_summary_context\":16384,\"atomic_summary_token_count\":true,\"data\":[",
                s->dedicated_summary_slot && s->slot_count > 1 ? "true" : "false");
     if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
@@ -16179,11 +16179,12 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
+    const bool count_only = !strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/atomic/summary-token-count");
     const int ctx_size = s->ctx_size;
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
-    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
+    } else if (!strcmp(hr.method, "POST") && (!strcmp(hr.path, "/v1/chat/completions") || count_only)) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
@@ -16194,6 +16195,23 @@ static void *client_main(void *arg) {
                                       ctx_size, &req, err, sizeof(err));
     } else {
         http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        http_request_free(&hr);
+        goto done;
+    }
+    if (count_only) {
+        /* Counting is CPU-only: no slot, KV state, sampling or tool execution.
+         * The normal chat parser owns template and tokenizer fidelity. */
+        if (!ok) http_error(fd, s->enable_cors, 400, err);
+        else if (!req.atomic_summary || req.image_count || req.has_tools)
+            http_error(fd, s->enable_cors, 400, "summary token counting requires text-only summary messages without tools");
+        else {
+            buf counted = {0};
+            buf_printf(&counted, "{\"input_tokens\":%d,\"context_length\":%d}",
+                       req.prompt.len, request_context_limit(s, &req));
+            http_response(fd, s->enable_cors, 200, "application/json", counted.ptr);
+            buf_free(&counted);
+        }
+        if (ok) request_free(&req);
         http_request_free(&hr);
         goto done;
     }
@@ -17036,7 +17054,7 @@ static void test_summary_slot_routing(void) {
     s.ctx_size = 65536;
     TEST_ASSERT(request_context_limit(&s, &j.req) == 65536);
     j.req.atomic_summary = true;
-    TEST_ASSERT(request_context_limit(&s, &j.req) == 8192);
+    TEST_ASSERT(request_context_limit(&s, &j.req) == 16384);
     j.req.atomic_summary = false;
     slots[0].decode_pending = true;
     TEST_ASSERT(summary_decode_must_yield(&s, 1));
