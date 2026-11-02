@@ -11626,7 +11626,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const char *restore_prompt) {
     if (!s || !slot) return false;
     /* Summaries are disposable computation, not conversation checkpoints. */
     if (s->dedicated_summary_slot && slot->id == s->slot_count - 1) return false;
@@ -11643,6 +11644,14 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
         return false;
     }
     pthread_mutex_lock(&s->kv_mu);
+    char *protected_path = NULL;
+    if (restore_prompt) {
+        int idx = ds4_kvstore_find_text_prefix(&s->kv, restore_prompt,
+            ds4_engine_model_id(s->engine), ds4_engine_routed_quant_bits(s->engine),
+            ds4_session_ctx(slot->session));
+        if (idx >= 0) protected_path = xstrdup(s->kv.entry[idx].path);
+    }
+    s->kv.protected_restore_path = protected_path;
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
                                                   tokens, store_len, reason,
@@ -11650,6 +11659,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
+    s->kv.protected_restore_path = NULL;
+    free(protected_path);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
@@ -11659,11 +11670,11 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
-static void kv_cache_store_current(server *s, server_slot *slot,
-                                   const char *reason) {
+static void kv_cache_store_current_for_request(server *s, server_slot *slot,
+                                   const char *reason, const char *restore_prompt) {
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -11699,11 +11710,17 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key, restore_prompt);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                        NULL, 0, NULL, restore_prompt);
     }
+}
+
+static void kv_cache_store_current(server *s, server_slot *slot,
+                                   const char *reason) {
+    kv_cache_store_current_for_request(s, slot, reason, NULL);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -14356,8 +14373,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, slot, "evict");
+         * would silently discard the newer conversation state. Protect the disk
+         * prefix selected for this request while saving that outgoing slot;
+         * under a tight budget, skip the save rather than destroy the restore. */
+        kv_cache_store_current_for_request(s, slot, "evict", j->req.prompt_text);
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -23352,6 +23371,45 @@ static void test_kv_cache_eviction_makes_room_before_store(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_preserves_pending_restore(void) {
+    char tmpl[] = "/tmp/ds4-kv-protected-restore.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *text = "real conversation checkpoint";
+    test_kv_text_stub_file(dir, text, KV_REASON_COLD, 512, 0);
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    int idx = kv_cache_find_text_prefix(&kc,
+        "real conversation checkpoint and next message", 2, 32768);
+    TEST_ASSERT(idx >= 0);
+    if (idx < 0) { kv_cache_close(&kc); rmdir(dir); return; }
+    char *path = xstrdup(kc.entry[idx].path);
+    kc.budget_bytes = kc.entry[idx].file_size + 16;
+    kc.protected_restore_path = path;
+    const char *other_sha = "1111111111111111111111111111111111111111";
+    test_kv_stub_file(dir, other_sha, KV_REASON_SHUTDOWN, 1024, 50,
+                     (uint64_t)time(NULL), 128);
+    char *other_path = path_join(dir,
+        "1111111111111111111111111111111111111111.kv");
+    /* The outgoing QA slot cannot evict the candidate, even when both
+     * snapshots cannot fit. Refreshing the index must preserve protection. */
+    kv_cache_evict(&kc, NULL, kc.budget_bytes - 8, NULL);
+    TEST_ASSERT(access(path, F_OK) == 0);
+    TEST_ASSERT(access(other_path, F_OK) != 0);
+    free(other_path);
+    TEST_ASSERT(kv_cache_find_text_prefix(&kc,
+        "real conversation checkpoint and next message", 2, 32768) >= 0);
+    kc.protected_restore_path = NULL;
+    kv_cache_evict(&kc, NULL, kc.budget_bytes - 8, NULL);
+    TEST_ASSERT(access(path, F_OK) != 0);
+    kv_cache_close(&kc);
+    free(path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
     char tmpl[] = "/tmp/ds4-kv-oversize-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -24544,6 +24602,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();
+    test_kv_cache_eviction_preserves_pending_restore();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();

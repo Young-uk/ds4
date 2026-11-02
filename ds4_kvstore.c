@@ -575,22 +575,23 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
-            double score =
-                ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
-                                                 incoming);
-            if (score < victim_score ||
+        int victim = -1;
+        double victim_score = 0;
+        for (int i = 0; i < kc->len; i++) {
+            if (kc->protected_restore_path && kc->entry[i].path &&
+                !strcmp(kc->protected_restore_path, kc->entry[i].path)) continue;
+            double score = ds4_kvstore_entry_eviction_score(
+                &kc->entry[i], live, now, incoming);
+            if (victim < 0 || score < victim_score ||
                 (score == victim_score &&
-                 kc->entry[i].last_used < kc->entry[victim].last_used))
-            {
+                 kc->entry[i].last_used < kc->entry[victim].last_used)) {
                 victim = i;
                 victim_score = score;
             }
         }
+        /* Prefer restoring the requested conversation to saving an unrelated
+         * outgoing slot. Never delete the restore candidate to make room. */
+        if (victim < 0) break;
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1068,6 +1069,19 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .reject_different_quant = kc->reject_different_quant,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
+    uint64_t retained_bytes = 0;
+    for (int i = 0; i < kc->len; i++) retained_bytes += kc->entry[i].file_size;
+    if (retained_bytes > kc->budget_bytes - est_file_bytes) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped reason=restore-candidate-protected tokens=%d",
+                kv_log_name(kc), store_tokens.len);
+        ds4_session_payload_file_free(&staged);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+
 
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
