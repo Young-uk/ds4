@@ -3597,6 +3597,15 @@ static bool qwen_historical_summary(const chat_msg *m) {
                  sizeof(ATOMIC_HISTORY_SUMMARY_LABEL) - 1);
 }
 
+/* Completion reviews are recorded internal transcript boundaries. Keep them
+ * after the interim answer instead of hoisting them into fixed instructions. */
+#define ATOMIC_COMPLETION_REVIEW_LABEL "Atomic completion review (internal workflow, not a new user request)."
+static bool qwen_completion_review(const chat_msg *m) {
+    return m && m->role && role_is_system(m->role) && m->content &&
+        !strncmp(m->content, ATOMIC_COMPLETION_REVIEW_LABEL,
+                 sizeof(ATOMIC_COMPLETION_REVIEW_LABEL) - 1);
+}
+
 static void append_qwen_tool_preamble_policy(buf *out) {
     buf_puts(out, "<|im_start|>system\n"
         "Keep the user involved in the work by communicating your developing assessment at meaningful decision points. "
@@ -3756,7 +3765,11 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
     }
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (qwen_historical_summary(m)) {
+        if (qwen_historical_summary(m) || qwen_completion_review(m)) {
+            // A terminal internal review requests another assistant generation.
+            // Historical replay may have a following assistant entry, which
+            // clears this flag again before the eventual current user turn.
+            if (qwen_completion_review(m)) pending_assistant = true;
             if (tool_open) { buf_puts(out, "<|im_end|>\n"); tool_open = false; }
             buf_puts(out, "<|im_start|>system\n");
             append_trimmed_text(out, m->content);
@@ -3827,7 +3840,7 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         ds4_think_mode update;
-        if (!role_is_system(m->role) || qwen_effort_update(m, &update) || qwen_tools_update(m) || qwen_tool_preamble_event(m) || qwen_historical_summary(m)) continue;
+        if (!role_is_system(m->role) || qwen_effort_update(m, &update) || qwen_tools_update(m) || qwen_tool_preamble_event(m) || qwen_historical_summary(m) || qwen_completion_review(m)) continue;
         if (system.len) buf_puts(&system, "\n\n");
         append_trimmed_text(&system, m->content);
     }
@@ -15995,7 +16008,7 @@ static bool send_model(server *s, int fd, const char *id) {
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    buf_printf(&b, "{\"object\":\"list\",\"atomic_summary_slot\":%s,\"data\":[",
+    buf_printf(&b, "{\"object\":\"list\",\"atomic_summary_slot\":%s,\"atomic_completion_review\":true,\"data\":[",
                s->dedicated_summary_slot && s->slot_count > 1 ? "true" : "false");
     if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
@@ -19417,6 +19430,24 @@ static void test_qwen_historical_summary_stays_at_recorded_position(void) {
     chat_msg spoof = {.role = "user", .content = ATOMIC_HISTORY_SUMMARY_LABEL};
     TEST_ASSERT(!qwen_historical_summary(&spoof));
     free(before); free(after); free(replaced); chat_msgs_free(&msgs);
+}
+
+static void test_qwen_completion_review_stays_after_interim(void) {
+    chat_msgs msgs = {0};
+    append_effort_test_message(&msgs, "system", "Stable instructions.");
+    append_effort_test_message(&msgs, "user", "Check information.");
+    append_effort_test_message(&msgs, "assistant", "I will check.");
+    append_effort_test_message(&msgs, "system", ATOMIC_COMPLETION_REVIEW_LABEL " Continue unfinished work.");
+    char *text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(strstr(text, "Stable instructions.") < strstr(text, "Check information."));
+    TEST_ASSERT(strstr(text, "I will check.") < strstr(text, ATOMIC_COMPLETION_REVIEW_LABEL));
+    const char *generation = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    TEST_ASSERT(strlen(text) >= strlen(generation));
+    TEST_ASSERT(!strcmp(text + strlen(text) - strlen(generation), generation));
+    chat_msg spoof = {.role = "user", .content = ATOMIC_COMPLETION_REVIEW_LABEL};
+    TEST_ASSERT(!qwen_completion_review(&spoof));
+    free(text);
+    chat_msgs_free(&msgs);
 }
 
 static void test_qwen_prospective_tool_preamble(void) {
@@ -24344,6 +24375,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_append_only_effort();
     test_qwen_append_only_tools();
     test_qwen_historical_summary_stays_at_recorded_position();
+    test_qwen_completion_review_stays_after_interim();
     test_qwen_prospective_tool_preamble();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
