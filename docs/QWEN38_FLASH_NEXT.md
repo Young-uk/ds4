@@ -255,3 +255,37 @@ Restart with a larger `--ctx`, then `/switch` to the saved session and
 `/compact` to recover room. Sessions containing images still use the existing
 save restriction. Automatic compaction reserves summary space and continues
 interrupted generation through the existing agent compaction path.
+
+## Personal chat summary and restart checkpoints
+
+Atomic historical-summary system messages remain at their recorded position
+in the Qwen transcript; they are not merged into the leading system block.
+Only the explicit historical-summary label is treated this way. Ordinary
+system messages and recorded effort/tool events retain their existing rules.
+
+For a leading system prefix of at least 1,024 tokens, the server keeps its
+single recurrent-state anchor at that boundary. With disk caching enabled, it
+also saves that prefix when the prefix fits the configured cold limit, even
+when the whole chat exceeds that limit. The configured minimum, cold cap,
+disk budget and text-only restrictions still apply. No second live snapshot
+is allocated. Short system prefixes keep the last-turn anchor strategy.
+
+A matching saved full conversation can resume after a graceful restart. If a
+new summary changes the later transcript, a matching fixed-prefix snapshot
+can recover the instructions instead. Dialogue after a changed prefix still
+needs evaluation. Disk eviction, disabled caching, incompatible model/context
+or changed instructions can prevent a hit; a cache hit is not guaranteed.
+
+Run the model-backed regression separately from other large model servers:
+
+```sh
+python3 tests/test_qwen4_summary_restart.py --model /path/to/model.gguf \
+  --output /tmp/qwen-summary-restart
+```
+
+For a split GGUF, also pass `--ngram-model /path/to/ngram-shard.gguf`.
+
+This uses synthetic messages, a new cache directory and an isolated port. It
+checks long-first-prompt prefix persistence, historical system-summary
+replacement, an appended turn, first-request recovery after restart, and a
+changed summary after that disk restore. It retains its artifacts for review.
