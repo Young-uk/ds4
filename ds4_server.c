@@ -11807,6 +11807,75 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
+/* Diagnostic only: compare rendered text, never the model payload, and never
+ * emit user text. Bound extra I/O to eight candidates of at most 8 MiB each. */
+static size_t cache_diag_common_bytes(const char *a, size_t an,
+                                      const char *b, size_t bn) {
+    size_t i = 0;
+    while (i < an && i < bn && a[i] == b[i]) i++;
+    return i;
+}
+
+static const char *cache_diag_text_region(const char *text, size_t boundary) {
+    const char *region = "preamble";
+    const char *p = text;
+    while ((p = strstr(p, "<|im_start|>")) && (size_t)(p - text) <= boundary) {
+        p += strlen("<|im_start|>");
+        if (!strncmp(p, "system\n", 7)) region = "system";
+        else if (!strncmp(p, "user\n", 5)) region = "user";
+        else if (!strncmp(p, "assistant\n", 10)) region = "assistant";
+        else if (!strncmp(p, "tool\n", 5)) region = "tool";
+        else region = "other";
+    }
+    return region;
+}
+
+static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
+                                          const char *prompt, int loaded, int model_id,
+                                          int ctx_size, int quant_bits) {
+    if (!prompt) return;
+    size_t pn = strlen(prompt);
+    int reported = 0;
+    for (int i = 0; i < kc->len && reported < 8; i++) {
+        const ds4_kvstore_entry *e = &kc->entry[i];
+        if ((int)e->tokens <= loaded) continue;
+        reported++;
+        const char *reason = "diagnostic-size-limit";
+        size_t common = 0;
+        const char *saved_region = "unknown", *input_region = "unknown";
+        if (e->text_bytes <= 8u * 1024u * 1024u) {
+            FILE *fp = fopen(e->path, "rb");
+            ds4_kvstore_entry header = {0};
+            uint32_t n = 0;
+            reason = "diagnostic-read-failed";
+            if (fp && ds4_kvstore_read_header(fp, &header, &n) && n == e->text_bytes) {
+                char *text = xmalloc((size_t)n + 1);
+                if (fread(text, 1, n, fp) == n) {
+                    text[n] = '\0';
+                    common = cache_diag_common_bytes(text, n, prompt, pn);
+                    reason = common < n && common < pn ? "text-mismatch" :
+                             n > pn ? "checkpoint-longer-than-input" : "text-prefix-matches";
+                    saved_region = cache_diag_text_region(text, common);
+                    input_region = cache_diag_text_region(prompt, common);
+                }
+                free(text);
+            }
+            if (fp) fclose(fp);
+        }
+        /* Report lookup eligibility separately from the byte comparison. A
+         * matching text prefix can still be incompatible with this session. */
+        const char *eligibility = e->model_id != model_id ? "model-mismatch" :
+            e->ctx_size > (uint32_t)ctx_size ? "context-too-small" :
+            kc->reject_different_quant && e->quant_bits != quant_bits ? "quant-mismatch" :
+            (int)e->tokens < kc->opt.min_tokens ? "below-minimum" : "eligible";
+        server_log(DS4_LOG_KVCACHE,
+                   "[cache-diag] event=disk-candidate key=%.40s tokens=%u selected_tokens=%d saved_bytes=%llu input_bytes=%zu common_bytes=%zu saved_region=%s input_region=%s reason=%s eligibility=%s model=%u ctx=%u quant=%u",
+                   e->sha, e->tokens, loaded, (unsigned long long)e->text_bytes,
+                   pn, common, saved_region, input_region, reason, eligibility,
+                   e->model_id, e->ctx_size, e->quant_bits);
+    }
+}
+
 static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
                                   ds4_tokens *effective_prompt,
@@ -11829,6 +11898,10 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
+    kv_cache_log_rejected_prefixes(&s->kv, prompt_text, loaded,
+                                  ds4_engine_model_id(s->engine),
+                                  ds4_session_ctx(slot->session),
+                                  ds4_engine_routed_quant_bits(s->engine));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
@@ -12210,8 +12283,42 @@ static int prompt_fixed_disk_split(const ds4_tokens *prompt, int marker,
     return fixed >= kc->opt.min_tokens && fixed <= kc->opt.cold_max_tokens ? fixed : 0;
 }
 
+/* A chat may have several leading system turns (persona, tool metadata,
+ * effort). Snapshot after all of them, not after persona alone. Compare token
+ * headers rather than searching user-supplied text for apparent role markers. */
+static int prompt_system_run_split(const ds4_tokens *prompt,
+                                    const ds4_tokens *header, int marker) {
+    if (!prompt || !header || header->len <= 1 ||
+        prompt->len < header->len || prompt->v[0] != marker ||
+        memcmp(prompt->v, header->v, (size_t)header->len * sizeof(int))) return -1;
+    for (int i = header->len; i < prompt->len; i++) {
+        if (prompt->v[i] != marker) continue;
+        if (i + header->len <= prompt->len &&
+            !memcmp(prompt->v + i, header->v, (size_t)header->len * sizeof(int))) {
+            i += header->len - 1;
+            continue;
+        }
+        return i >= PROMPT_ANCHOR_MIN_TOKENS ? i : -1;
+    }
+    return -1;
+}
+
+static int prompt_system_run_for_request(server *s, const request *req,
+                                         const ds4_tokens *prompt) {
+    const char *text = "<|im_start|>system\n";
+    if (!req->prompt_text || strncmp(req->prompt_text, text, strlen(text))) return -1;
+    ds4_tokens header = {0};
+    ds4_tokenize_rendered_chat(s->engine, text, &header);
+    const int split = prompt_system_run_split(prompt, &header,
+                                              ds4_token_turn_start(s->engine));
+    ds4_tokens_free(&header);
+    return split;
+}
+
 static int prompt_anchor_split(server *s, const request *req,
                                 const ds4_tokens *prompt, int start) {
+    const int fixed = prompt_system_run_for_request(s, req, prompt);
+    if (fixed >= 0) return fixed >= start ? fixed : -1;
     const char *header = "<|im_start|>system\n";
     const bool leading_system = req->prompt_text &&
         !strncmp(req->prompt_text, header, strlen(header));
@@ -14516,9 +14623,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         const char *header = "<|im_start|>system\n";
         const bool leading_system = j->req.prompt_text &&
             !strncmp(j->req.prompt_text, header, strlen(header));
-        const int fixed = prompt_fixed_disk_split(prompt_for_sync,
+        int fixed = prompt_system_run_for_request(s, &j->req, prompt_for_sync);
+        if (fixed < 0) fixed = prompt_fixed_disk_split(prompt_for_sync,
             ds4_token_turn_start(s->engine), leading_system, &s->kv);
-        if (fixed > 0) cold_store_len = fixed;
+        if (s->kv.enabled && s->kv.opt.cold_max_tokens > 0 &&
+            fixed >= s->kv.opt.min_tokens && fixed <= s->kv.opt.cold_max_tokens)
+            cold_store_len = fixed;
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -22267,6 +22377,18 @@ static void test_tool_history_validation_handles_large_replays(void) {
     chat_msgs_free(&anthropic);
 }
 
+static void test_cache_candidate_diagnostics_boundaries(void) {
+    const char *a = "<|im_start|>system\nprivate-A<|im_end|>\n<|im_start|>user\nquestion";
+    const char *b = "<|im_start|>system\nprivate-B<|im_end|>\n<|im_start|>user\nquestion";
+    size_t common = cache_diag_common_bytes(a, strlen(a), b, strlen(b));
+    TEST_ASSERT(common == (size_t)(strstr(a, "A<") - a));
+    TEST_ASSERT(!strcmp(cache_diag_text_region(a, common), "system"));
+    TEST_ASSERT(cache_diag_common_bytes(a, 4, a, strlen(a)) == 4);
+    TEST_ASSERT(cache_diag_common_bytes("", 0, a, strlen(a)) == 0);
+    TEST_ASSERT(!strcmp(cache_diag_text_region(a, strlen(a)), "user"));
+    TEST_ASSERT(!strcmp(cache_diag_text_region("plain", 3), "preamble"));
+}
+
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
@@ -22323,6 +22445,23 @@ static void test_fixed_prefix_prompt_anchor(void) {
     TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, -1, true) == -1);
     prompt.len = 512;
     TEST_ASSERT(prompt_anchor_token_split(&prompt, 0, marker, true) == -1);
+}
+
+static void test_multiple_system_prefix_anchor(void) {
+    int values[4096] = {0};
+    int header_values[] = {77, 11, 12};
+    ds4_tokens prompt = {.v = values, .len = 4096};
+    ds4_tokens header = {.v = header_values, .len = 3};
+    memcpy(values, header_values, sizeof(header_values));
+    memcpy(values + 1536, header_values, sizeof(header_values));
+    memcpy(values + 2048, header_values, sizeof(header_values));
+    values[3072] = 77;
+    values[3073] = 99; /* First user turn: never cache mutable dialogue here. */
+    TEST_ASSERT(prompt_system_run_split(&prompt, &header, 77) == 3072);
+    values[1537] = 99;
+    TEST_ASSERT(prompt_system_run_split(&prompt, &header, 77) == 1536);
+    values[0] = 99;
+    TEST_ASSERT(prompt_system_run_split(&prompt, &header, 77) == -1);
 }
 
 static void test_live_prefix_rewind_target(void) {
@@ -24683,8 +24822,10 @@ static void ds4_server_unit_tests_run(void) {
     test_json_string_handles_surrogates();
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
+    test_cache_candidate_diagnostics_boundaries();
     test_model_metadata_clamps_completion_to_context();
     test_fixed_prefix_prompt_anchor();
+    test_multiple_system_prefix_anchor();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
