@@ -16175,6 +16175,8 @@ static void wait_for_job_or_disconnect(server *s, job *j) {
     pthread_mutex_unlock(&j->mu);
 }
 
+#include "ds4_resumable.h"
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -16189,6 +16191,11 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (atomic_stream_route(s, fd, &hr)) {
         http_request_free(&hr);
         goto done;
     }
@@ -17056,6 +17063,7 @@ int main(int argc, char **argv) {
                    i, tokens->len);
         kv_cache_store_current(&s, slot, "shutdown");
     }
+    atomic_stream_cleanup();
     server_close_resources(&s);
     return 0;
 }
@@ -24119,6 +24127,88 @@ static void test_responses_tool_image_output(void) {
     }
 }
 
+static void test_atomic_stream_resume_cursor(void) {
+    TEST_ASSERT(atomic_stream_id_valid("12345678-1234-1234-1234-123456789abc"));
+    TEST_ASSERT(!atomic_stream_id_valid("../12345-1234-1234-1234-123456789abc"));
+    atomic_stream r = {0};
+    strcpy(r.path, "/tmp/atomic-sse-test-XXXXXX");
+    int file = mkstemp(r.path);
+    TEST_ASSERT(file >= 0);
+    const char *first = "data: first\n\n";
+    const char *last = "data: second\n\ndata: [DONE]\n\n";
+    TEST_ASSERT(atomic_stream_append(&r, file, first, strlen(first)));
+    TEST_ASSERT(atomic_stream_append(&r, file, last, strlen(last)));
+    close(file);
+    r.done = 1; r.http_status = 200;
+    server s = {0};
+    int pair[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    atomic_stream_tail(&s, pair[0], &r, strlen(first));
+    shutdown(pair[0], SHUT_WR);
+    char reply[2048] = {0};
+    ssize_t n = read(pair[1], reply, sizeof(reply) - 1);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(strstr(reply, "data: first") == NULL);
+    TEST_ASSERT(strstr(reply, last) != NULL);
+    close(pair[0]); close(pair[1]); unlink(r.path);
+    __atomic_fetch_sub(&atomic_stream_bytes, r.length, __ATOMIC_RELAXED);
+}
+
+static void test_atomic_stream_early_cancel(void) {
+    server s = {0};
+    int pair[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    http_request cancel = {0};
+    strcpy(cancel.method, "DELETE");
+    strcpy(cancel.path, "/v1/atomic/streams/12345678-1234-1234-1234-123456789abc");
+    TEST_ASSERT(atomic_stream_route(&s, pair[0], &cancel));
+    atomic_stream *r = atomic_stream_find("12345678-1234-1234-1234-123456789abc");
+    TEST_ASSERT(r && r->cancelled && r->done);
+    char reply[1024];
+    TEST_ASSERT(read(pair[1], reply, sizeof(reply)) > 0);
+    http_request late = {0};
+    strcpy(late.method, "POST"); strcpy(late.path, cancel.path);
+    late.body = "{}"; late.body_len = 2;
+    TEST_ASSERT(atomic_stream_route(&s, pair[0], &late));
+    memset(reply, 0, sizeof(reply));
+    TEST_ASSERT(read(pair[1], reply, sizeof(reply) - 1) > 0);
+    TEST_ASSERT(strstr(reply, "409") != NULL);
+    TEST_ASSERT(atomic_stream_find(r->id) == r);
+    close(pair[0]); close(pair[1]); atomic_stream_cleanup();
+}
+
+static void test_atomic_stream_preserves_http_errors_and_deduplicates(void) {
+    server s = {0};
+    pthread_mutex_init(&s.mu, NULL); pthread_cond_init(&s.clients_cv, NULL);
+    int pair[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    http_request hr = {0};
+    strcpy(hr.method, "POST");
+    strcpy(hr.path, "/v1/atomic/streams/abcdef12-1234-1234-1234-123456789abc");
+    hr.body = "!"; hr.body_len = 1;
+    TEST_ASSERT(atomic_stream_route(&s, pair[0], &hr));
+    char reply[2048] = {0};
+    TEST_ASSERT(read(pair[1], reply, sizeof(reply) - 1) > 0);
+    TEST_ASSERT(strstr(reply, "HTTP/1.1 400") != NULL);
+    atomic_stream *r = atomic_stream_find("abcdef12-1234-1234-1234-123456789abc");
+    TEST_ASSERT(r && r->done && r->http_status == 400);
+    TEST_ASSERT(atomic_stream_route(&s, pair[0], &hr));
+    memset(reply, 0, sizeof(reply));
+    TEST_ASSERT(read(pair[1], reply, sizeof(reply) - 1) > 0);
+    TEST_ASSERT(strstr(reply, "HTTP/1.1 400") != NULL);
+    TEST_ASSERT(atomic_stream_find(r->id) == r && atomic_stream_count == 1);
+    hr.body = "{}"; hr.body_len = 2;
+    TEST_ASSERT(atomic_stream_route(&s, pair[0], &hr));
+    memset(reply, 0, sizeof(reply));
+    TEST_ASSERT(read(pair[1], reply, sizeof(reply) - 1) > 0);
+    TEST_ASSERT(strstr(reply, "HTTP/1.1 409") != NULL);
+    pthread_mutex_lock(&s.mu);
+    while (s.clients) pthread_cond_wait(&s.clients_cv, &s.mu);
+    pthread_mutex_unlock(&s.mu);
+    close(pair[0]); close(pair[1]); atomic_stream_cleanup();
+    pthread_cond_destroy(&s.clients_cv); pthread_mutex_destroy(&s.mu);
+}
+
 static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
     uint8_t key = 1;
@@ -24434,6 +24524,9 @@ static void ds4_server_unit_tests_run(void) {
     test_old_images_are_omitted_in_steps();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
+    test_atomic_stream_resume_cursor();
+    test_atomic_stream_early_cancel();
+    test_atomic_stream_preserves_http_errors_and_deduplicates();
     test_server_image_embedding_cache();
     test_summary_slot_routing();
     test_batched_prefill_round_robin();
