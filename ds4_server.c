@@ -10481,6 +10481,7 @@ struct server {
     pthread_cond_t model_cv;
     bool model_busy;
     bool qwen4_batch_mtp;
+    bool qwen4_summary_mtp;
     bool model_stopping;
     int decode_pending;
     int active_generations;
@@ -13005,6 +13006,14 @@ static bool summary_decode_must_yield(const server *s, int slot_id) {
         (s->slots[0].decode_pending || s->slots[0].prefill_waiting);
 }
 
+/* Summary decoding is greedy: verify each MTP draft with the base model.
+ * Keep nonzero-temperature summaries and all existing chat sampling unchanged.
+ * The executor still yields this resident slot to foreground GPU work. */
+static bool request_batch_mtp_enabled(const server *s, const request *r, float temperature) {
+    return r->atomic_summary ? (s->qwen4_summary_mtp && temperature == 0.0f)
+                             : s->qwen4_batch_mtp;
+}
+
 static bool server_prefill_waits_for_decode(const server *s, const server_slot *slot) {
     // A queued summary token must not starve a newly arrived chat prompt.
     return !(s->dedicated_summary_slot && slot->id == 0);
@@ -14830,7 +14839,7 @@ resume_empty_reply:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp && !j->req.atomic_summary &&
+        } else if (s->batched_mode && request_batch_mtp_enabled(s, &j->req, temperature) &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -16876,6 +16885,10 @@ int main(int argc, char **argv) {
     s.dedicated_summary_slot = cfg.dedicated_summary_slot;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
+    s.qwen4_summary_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
+                         ds4_engine_is_qwen4(engine) && cfg.engine.glm_mtp;
+    if (s.qwen4_summary_mtp)
+        server_log(DS4_LOG_DEFAULT, "ds4-server: greedy summary MTP verification enabled");
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -17096,7 +17109,13 @@ static void test_summary_slot_routing(void) {
     TEST_ASSERT(request_context_limit(&s, &j.req) == 65536);
     j.req.atomic_summary = true;
     TEST_ASSERT(request_context_limit(&s, &j.req) == 16384);
+    s.qwen4_summary_mtp = true;
+    TEST_ASSERT(request_batch_mtp_enabled(&s, &j.req, 0.0f));
+    TEST_ASSERT(!request_batch_mtp_enabled(&s, &j.req, 0.5f));
     j.req.atomic_summary = false;
+    TEST_ASSERT(!request_batch_mtp_enabled(&s, &j.req, 0.0f));
+    s.qwen4_batch_mtp = true;
+    TEST_ASSERT(request_batch_mtp_enabled(&s, &j.req, 0.5f));
     slots[0].decode_pending = true;
     TEST_ASSERT(summary_decode_must_yield(&s, 1));
     TEST_ASSERT(!summary_decode_must_yield(&s, 0));
