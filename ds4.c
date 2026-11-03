@@ -57903,8 +57903,10 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
     }
 #endif
     enum { MAX_ROWS = 4096 };
-    qwen4_ngram_request *request = malloc(MAX_ROWS * sizeof(*request));
-    if (!request) return false;
+    /* The bounded request list is call-local: reuse it across chunks without
+     * allocating on the decode hot path or retaining per-thread heap memory.
+     * Readers finish synchronously before the list is reused. */
+    qwen4_ngram_request request[MAX_ROWS];
     bool ok = true;
     for (size_t off = 0; ok && off < count; off += MAX_ROWS) {
         size_t n = count-off < MAX_ROWS ? count-off : MAX_ROWS;
@@ -57935,9 +57937,6 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
             if (batch.error[i]) { errno = batch.error[i]; ok = false; break; }
         }
     }
-    int error = errno;
-    free(request);
-    errno = error;
     return ok;
 }
 

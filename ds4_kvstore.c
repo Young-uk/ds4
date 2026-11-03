@@ -1018,28 +1018,17 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return true;
     }
 
-    /* Staging can dominate shutdown for long contexts. Log before touching GPU
-     * state so an interrupted save is distinguishable from an absent attempt. */
-    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-            "%s: kv cache staging tokens=%d reason=%s", kv_log_name(kc),
-            store_tokens.len, reason);
-    ds4_session_payload_file staged = {0};
-    if (ds4_session_stage_payload(session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
-                kv_log_name(kc),
-                store_tokens.len,
-                reason,
-                save_err[0] ? save_err : "unknown error");
-        if (err && err_len) snprintf(err, err_len, "%s",
-                                     save_err[0] ? save_err : "unknown error");
+    /* Measure without serializing first. Write the payload once into the
+     * destination-side temporary file; the final rename still publishes only
+     * a complete, size-checked checkpoint. Avoid a second full SSD copy. */
+    uint64_t payload_bytes = ds4_session_payload_bytes(session);
+    if (!payload_bytes) {
+        if (err && err_len) snprintf(err, err_len, "session has no serializable checkpoint");
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
         return false;
     }
-    uint64_t payload_bytes = staged.bytes;
 
     uint64_t est_file_bytes = 0, est_required_bytes = 0;
     if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
@@ -1053,7 +1042,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)est_file_bytes / (1024.0 * 1024.0),
                 (double)est_required_bytes / (1024.0 * 1024.0),
                 (double)kc->budget_bytes / (1024.0 * 1024.0));
-        ds4_session_payload_file_free(&staged);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -1075,7 +1063,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache skipped reason=restore-candidate-protected tokens=%d",
                 kv_log_name(kc), store_tokens.len);
-        ds4_session_payload_file_free(&staged);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -1093,7 +1080,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 "%s: kv cache failed to create %s: %s save=%.1f ms",
                 kv_log_name(kc), tmp, strerror(errno),
                 (kv_now_sec() - save_t0) * 1000.0);
-        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         free(path);
@@ -1114,11 +1100,18 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
     uint64_t trailer_bytes = 0;
     errno = 0;
+    /* Staging can dominate shutdown for long contexts. Log before touching GPU
+     * state so an interrupted save is distinguishable from an absent attempt. */
+    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+            "%s: kv cache serializing tokens=%d reason=%s", kv_log_name(kc),
+            store_tokens.len, reason);
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
+              ds4_session_save_payload(session, fp,
                                                save_err, sizeof(save_err)) == 0 &&
+              ftello(fp) >= 0 &&
+              (uint64_t)ftello(fp) == sizeof(h) + sizeof(tb) + text_len + payload_bytes &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
               fflush(fp) == 0;
     int saved_errno = errno;
@@ -1178,7 +1171,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
     }
-    ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     free(path);
