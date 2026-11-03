@@ -11704,6 +11704,21 @@ static void kv_cache_store_current_for_request(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->tool_mu);
 
+    char *restore_text = NULL;
+    if (!restore_prompt) {
+        size_t text_len = 0;
+        restore_text = visible_text ? xstrdup(visible_text) : render_tokens_text(s->engine, tokens, &text_len);
+        /* Protect the reusable pre-user state, rather than an older complete
+         * answer that only matches this exact request. */
+        if (restore_text && ds4_engine_is_qwen4(s->engine)) {
+            char *last_user = NULL;
+            for (char *p = restore_text; (p = strstr(p, "<|im_start|>user\n")); p++)
+                last_user = p;
+            if (last_user && last_user != restore_text) *last_user = '\0';
+        }
+        restore_prompt = restore_text;
+    }
+
     /* A visible live checkpoint can contain hidden reasoning that the client
      * intentionally does not replay.  For disk recovery after a session switch,
      * key that payload by the visible protocol transcript, not by rendering the
@@ -11717,6 +11732,7 @@ static void kv_cache_store_current_for_request(server *s, server_slot *slot,
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
                                         NULL, 0, NULL, restore_prompt);
     }
+    free(restore_text);
 }
 
 static void kv_cache_store_current(server *s, server_slot *slot,
@@ -12313,6 +12329,18 @@ static int prompt_system_run_for_request(server *s, const request *req,
                                               ds4_token_turn_start(s->engine));
     ds4_tokens_free(&header);
     return split;
+}
+
+/* A recurrent Qwen checkpoint must be captured while prefill is exactly at
+ * the boundary; a later full payload cannot safely be sliced backwards. */
+static int restart_user_boundary(const ds4_tokens *prompt,
+                                 const ds4_tokens *user_header, int minimum) {
+    if (!prompt || !user_header || user_header->len < 2) return -1;
+    for (int i = prompt->len - user_header->len; i >= minimum; i--) {
+        if (!memcmp(prompt->v + i, user_header->v,
+                    (size_t)user_header->len * sizeof(int))) return i;
+    }
+    return -1;
 }
 
 static int prompt_anchor_split(server *s, const request *req,
@@ -14679,7 +14707,33 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     int prompt_sync_rc = 0;
-    if (!multimodal) {
+    if (prompt_sync_rc == 0 && !multimodal && s->kv.enabled && ds4_engine_is_qwen4(s->engine) &&
+        j->req.prompt_text) {
+        ds4_tokens user_header = {0};
+        ds4_tokenize_rendered_chat(s->engine, "<|im_start|>user", &user_header);
+        const int boundary = restart_user_boundary(prompt_for_sync, &user_header,
+                                                    s->kv.opt.min_tokens);
+        ds4_tokens_free(&user_header);
+        pthread_mutex_lock(&s->inference_mu);
+        const int position = ds4_session_pos(slot->session);
+        const bool prefix_valid = ds4_session_common_prefix(slot->session, prompt_for_sync) == position;
+        pthread_mutex_unlock(&s->inference_mu);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: restart boundary=%d live=%d prefix_valid=%d",
+                   boundary, position, prefix_valid);
+        if (boundary > position && prefix_valid) {
+            ds4_tokens head = *prompt_for_sync;
+            head.len = boundary;
+            prompt_sync_rc = server_session_sync(s, slot, &head, err, sizeof(err));
+            if (prompt_sync_rc == 0) {
+                /* Use the existing budget/ABI/hash-checked writer. No change to
+                 * model math, payload format, or other inference backends. */
+                if (kv_cache_store_live_prefix(s, slot, &head, boundary, "cold"))
+                    kv_cache_slot_note_store(slot, boundary);
+            }
+        }
+    }
+    if (prompt_sync_rc == 0 && !multimodal) {
         /* Stop the prefill at the prompt anchor to save the state there. */
         pthread_mutex_lock(&s->inference_mu);
         int start = ds4_session_pos(slot->session);
@@ -22409,6 +22463,17 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_restart_user_boundary(void) {
+    int input[] = {1, 2, 10, 11, 12, 5, 6, 10, 11, 12, 7, 8};
+    int header[] = {10, 11, 12};
+    ds4_tokens prompt = {.v = input, .len = 12};
+    ds4_tokens user = {.v = header, .len = 3};
+    TEST_ASSERT(restart_user_boundary(&prompt, &user, 2) == 7);
+    TEST_ASSERT(restart_user_boundary(&prompt, &user, 8) == -1);
+    prompt.len = 9; /* Incomplete role header must not count. */
+    TEST_ASSERT(restart_user_boundary(&prompt, &user, 2) == 2);
+}
+
 static void test_fixed_prefix_prompt_anchor(void) {
     int tokens[4096] = {0};
     const int marker = 77;
@@ -24825,6 +24890,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cache_candidate_diagnostics_boundaries();
     test_model_metadata_clamps_completion_to_context();
     test_fixed_prefix_prompt_anchor();
+    test_restart_user_boundary();
     test_multiple_system_prefix_anchor();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
