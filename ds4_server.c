@@ -12343,8 +12343,25 @@ static int restart_user_boundary(const ds4_tokens *prompt,
     return -1;
 }
 
+static int summary_evidence_anchor(const ds4_tokens *prompt,
+                                   const ds4_tokens *user_header, int start) {
+    const int boundary = restart_user_boundary(prompt, user_header,
+                                               PROMPT_ANCHOR_MIN_TOKENS);
+    return boundary >= start ? boundary : -1;
+}
+
 static int prompt_anchor_split(server *s, const request *req,
                                 const ds4_tokens *prompt, int start) {
+    /* Summary repairs append their changing task after identical evidence.
+     * Capture the recurrent state before that final user message, rather than
+     * the short system prefix or the generated assistant header. */
+    if (req->atomic_summary) {
+        ds4_tokens user_header = {0};
+        ds4_tokenize_rendered_chat(s->engine, "<|im_start|>user\n", &user_header);
+        const int evidence = summary_evidence_anchor(prompt, &user_header, start);
+        ds4_tokens_free(&user_header);
+        if (evidence >= 0) return evidence >= start ? evidence : -1;
+    }
     const int fixed = prompt_system_run_for_request(s, req, prompt);
     if (fixed >= 0) return fixed >= start ? fixed : -1;
     const char *header = "<|im_start|>system\n";
@@ -22474,6 +22491,19 @@ static void test_restart_user_boundary(void) {
     TEST_ASSERT(restart_user_boundary(&prompt, &user, 2) == 2);
 }
 
+static void test_summary_evidence_anchor(void) {
+    int tokens[4096] = {0};
+    int header[] = {77, 78, 79};
+    memcpy(tokens + 280, header, sizeof(header));
+    memcpy(tokens + 3500, header, sizeof(header));
+    ds4_tokens prompt = {.v = tokens, .len = 4096};
+    ds4_tokens user = {.v = header, .len = 3};
+    TEST_ASSERT(summary_evidence_anchor(&prompt, &user, 0) == 3500);
+    TEST_ASSERT(summary_evidence_anchor(&prompt, &user, 3501) == -1);
+    prompt.len = 3502; /* Do not anchor inside an incomplete trailing header. */
+    TEST_ASSERT(summary_evidence_anchor(&prompt, &user, 0) == -1);
+}
+
 static void test_fixed_prefix_prompt_anchor(void) {
     int tokens[4096] = {0};
     const int marker = 77;
@@ -24891,6 +24921,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_fixed_prefix_prompt_anchor();
     test_restart_user_boundary();
+    test_summary_evidence_anchor();
     test_multiple_system_prefix_anchor();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
