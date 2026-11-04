@@ -11846,6 +11846,17 @@ static const char *cache_diag_text_region(const char *text, size_t boundary) {
     return region;
 }
 
+/* Report only structural offsets, never private prompt contents. */
+static size_t cache_diag_message_index(const char *text, size_t boundary) {
+    size_t count = 0;
+    const char *p = text;
+    while ((p = strstr(p, "<|im_start|>")) && (size_t)(p - text) <= boundary) {
+        count++;
+        p += strlen("<|im_start|>");
+    }
+    return count;
+}
+
 static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
                                           const char *prompt, int loaded, int model_id,
                                           int ctx_size, int quant_bits) {
@@ -11857,7 +11868,7 @@ static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
         if ((int)e->tokens <= loaded) continue;
         reported++;
         const char *reason = "diagnostic-size-limit";
-        size_t common = 0;
+        size_t common = 0, message_index = 0;
         const char *saved_region = "unknown", *input_region = "unknown";
         if (e->text_bytes <= 8u * 1024u * 1024u) {
             FILE *fp = fopen(e->path, "rb");
@@ -11871,6 +11882,7 @@ static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
                     common = cache_diag_common_bytes(text, n, prompt, pn);
                     reason = common < n && common < pn ? "text-mismatch" :
                              n > pn ? "checkpoint-longer-than-input" : "text-prefix-matches";
+                    message_index = cache_diag_message_index(text, common);
                     saved_region = cache_diag_text_region(text, common);
                     input_region = cache_diag_text_region(prompt, common);
                 }
@@ -11885,9 +11897,9 @@ static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
             kc->reject_different_quant && e->quant_bits != quant_bits ? "quant-mismatch" :
             (int)e->tokens < kc->opt.min_tokens ? "below-minimum" : "eligible";
         server_log(DS4_LOG_KVCACHE,
-                   "[cache-diag] event=disk-candidate key=%.40s tokens=%u selected_tokens=%d saved_bytes=%llu input_bytes=%zu common_bytes=%zu saved_region=%s input_region=%s reason=%s eligibility=%s model=%u ctx=%u quant=%u",
+                   "[cache-diag] event=disk-candidate key=%.40s tokens=%u selected_tokens=%d saved_bytes=%llu input_bytes=%zu common_bytes=%zu message_index=%zu saved_region=%s input_region=%s reason=%s eligibility=%s model=%u ctx=%u quant=%u",
                    e->sha, e->tokens, loaded, (unsigned long long)e->text_bytes,
-                   pn, common, saved_region, input_region, reason, eligibility,
+                   pn, common, message_index, saved_region, input_region, reason, eligibility,
                    e->model_id, e->ctx_size, e->quant_bits);
     }
 }
@@ -13869,7 +13881,11 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
                                                const char *reasoning,
                                                const tool_calls *calls) {
     if (!r || !calls || calls->len == 0) return NULL;
-    if (r->kind != REQ_CHAT || r->image_count != 0) return NULL;
+    /* The key is normalized with image fingerprints/offsets by
+     * thinking_live_remember(), and both probing and suffix materialization
+     * validate that image prefix. Historical images must not disable the
+     * tool-turn checkpoint, or one tool call discards the entire live tail. */
+    if (r->kind != REQ_CHAT) return NULL;
     if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return NULL;
     if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN) return NULL;
     if (!r->prompt_text || !r->prompt_text[0]) return NULL;
@@ -14736,6 +14752,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
+    int fixed_store_len = 0;
     int cold_store_len = 0;
     if (!multimodal && cached == 0 &&
         s->kv.enabled &&
@@ -14763,7 +14780,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_token_turn_start(s->engine), leading_system, &s->kv);
         if (s->kv.enabled && s->kv.opt.cold_max_tokens > 0 &&
             fixed >= s->kv.opt.min_tokens && fixed <= s->kv.opt.cold_max_tokens)
-            cold_store_len = fixed;
+            fixed_store_len = cold_store_len = fixed;
     }
     if (s->kv.enabled && ds4_engine_is_qwen4(s->engine)) {
         const int durable = durable_text_boundary(s, &j->req, prompt_for_sync);
@@ -14771,6 +14788,21 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         // The existing disk budget and writer still decide whether it is saved.
         if (durable >= s->kv.opt.min_tokens && durable > cached)
             cold_store_len = durable;
+    }
+    /* The durable dialogue boundary can replace cold_store_len. Preserve the
+     * independent fixed-instruction checkpoint before advancing recurrent state;
+     * a later payload cannot safely be sliced back to this boundary. */
+    if (fixed_store_len > cached && fixed_store_len < cold_store_len) {
+        ds4_tokens fixed_head = *prompt_for_sync;
+        fixed_head.len = fixed_store_len;
+        if (server_session_sync(s, slot, &fixed_head, err, sizeof(err)) == 0) {
+            if (kv_cache_store_live_prefix(s, slot, &fixed_head,
+                                           fixed_store_len, "cold"))
+                server_log(DS4_LOG_KVCACHE,
+                           "[cache-diag] event=fixed-prefix-stored tokens=%d durable_tokens=%d",
+                           fixed_store_len, cold_store_len);
+        }
+        /* The normal sync below owns failure reporting and cancellation. */
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -16532,6 +16564,13 @@ static void *client_main(void *arg) {
         else if (!req.atomic_summary || req.image_count || req.has_tools)
             http_error(fd, s->enable_cors, 400, "summary token counting requires text-only summary messages without tools");
         else {
+            /* Counts include oversized raw-history probes: they are CPU-only,
+             * not inference jobs. Keep numeric evidence in the durable log so
+             * a missing background extraction can be distinguished from a
+             * below-threshold decision without logging conversation text. */
+            server_log(DS4_LOG_KVCACHE,
+                       "[summary-diag] event=token-count input_tokens=%d context=%d",
+                       req.prompt.len, request_context_limit(s, &req));
             buf counted = {0};
             buf_printf(&counted, "{\"input_tokens\":%d,\"context_length\":%d}",
                        req.prompt.len, request_context_limit(s, &req));
@@ -17935,6 +17974,9 @@ static void test_slot_probe_vision_tiers(void) {
             strlen(slot.thinking_live.visible_text);
         slot.thinking_live.images.count = 1;
         slot.thinking_live.images.offsets[0] = 4;
+        ds4_vision_span checkpoint_image = {.token_start = 0,
+            .embedding = {.token_count = 2, .fingerprint = {9}}};
+        ds4_session_set_test_images(slot.session, &checkpoint_image, 1);
         job j = {0};
         j.req.kind = REQ_CHAT;
         j.req.api = API_OPENAI;
@@ -17944,13 +17986,19 @@ static void test_slot_probe_vision_tiers(void) {
                  "<M-BBB>");
         j.req.images = calloc(1, sizeof(*j.req.images));
         j.req.images[0].token_start = 16;
-        j.req.images[0].embedding.token_count = 16;
+        j.req.images[0].embedding.token_count = 2;
         j.req.images[0].embedding.fingerprint[0] = 9;
         j.req.image_count = 1;
         ds4_tokens_push(&j.req.prompt, 999);
         slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
         TEST_ASSERT(pr.kind == REUSE_THINKING_VISIBLE);
         TEST_ASSERT(pr.reuse_tokens == 10);
+        /* A visible tool frontier must never authenticate changed pixels
+         * solely because its normalized text and marker offsets match. */
+        j.req.images[0].embedding.fingerprint[0] = 8;
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        j.req.images[0].embedding.fingerprint[0] = 9;
         /* Same text, image shifted: offset mismatch must not bind. */
         free(j.req.prompt_text);
         j.req.prompt_text = xstrdup("see now? <M-BBB> later and more");
@@ -19938,8 +19986,10 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             TEST_ASSERT(build_qwen_tool_turn_visible_text(
                 &r, "tool_calls", true, assistant.content, NULL, &assistant.calls) == NULL);
             r.image_count = 1;
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
-                &r, "tool_calls", false, assistant.content, NULL, &assistant.calls) == NULL);
+            char *image_visible = build_qwen_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, NULL, &assistant.calls);
+            TEST_ASSERT(image_visible && !strcmp(image_visible, visible));
+            free(image_visible);
             r.image_count = 0;
             r.api = API_RESPONSES;
             TEST_ASSERT(build_qwen_tool_turn_visible_text(
@@ -22577,6 +22627,9 @@ static void test_cache_candidate_diagnostics_boundaries(void) {
     TEST_ASSERT(cache_diag_common_bytes("", 0, a, strlen(a)) == 0);
     TEST_ASSERT(!strcmp(cache_diag_text_region(a, strlen(a)), "user"));
     TEST_ASSERT(!strcmp(cache_diag_text_region("plain", 3), "preamble"));
+    TEST_ASSERT(cache_diag_message_index(a, common) == 1);
+    TEST_ASSERT(cache_diag_message_index(a, strlen(a)) == 2);
+    TEST_ASSERT(cache_diag_message_index("plain", 3) == 0);
 }
 
 static void test_model_metadata_clamps_completion_to_context(void) {

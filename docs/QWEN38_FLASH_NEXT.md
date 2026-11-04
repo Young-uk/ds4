@@ -289,3 +289,27 @@ This uses synthetic messages, a new cache directory and an isolated port. It
 checks long-first-prompt prefix persistence, historical system-summary
 replacement, an appended turn, first-request recovery after restart, and a
 changed summary after that disk restore. It retains its artifacts for review.
+
+### Independent fixed-prefix restart checkpoints
+
+A durable dialogue checkpoint and a fixed-instruction checkpoint serve different
+restart cases. Preserve both exact prefill states: selecting a later dialogue
+boundary must not overwrite the earlier fixed-system boundary before it is
+serialized. Qwen recurrent state cannot be sliced from a later payload after the
+fact. Both writes use the existing authenticated writer, size limits and disk
+budget; cache pressure may still evict a checkpoint. No image-conditioned payload
+is restored using text identity alone.
+
+Cache candidate diagnostics include a one-based `message_index` at the first
+byte mismatch (zero for a preamble). This reports structural position without
+logging private message text. A changed historical message still requires
+re-evaluating its suffix; the independent fixed prefix only avoids recomputing
+unchanged instructions.
+
+Verification (2026-11-05): the server regression suite passed. An isolated SSD
+IQ3_XXS live test used an 8K context and a separate 1GiB cache. After changing the
+first historical user message across a restart, 3,592 fixed-prefix tokens were
+restored and 656 tokens were evaluated (6.10s response). The next request reused
+4,249 tokens (0.54s); another restart restored 4,251 tokens (0.55s). All final
+answers completed. This does not claim full reuse across a genuinely changed
+history or recovery of image-conditioned disk payloads.
