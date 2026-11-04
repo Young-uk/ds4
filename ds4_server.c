@@ -11928,10 +11928,53 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     return loaded;
 }
 
+/* Disk snapshots contain text-only state. Restore only the exact token prefix
+ * before the first image; image placeholders never authenticate image pixels. */
+static bool multimodal_disk_prefix_matches(const request *req,
+                                            const ds4_tokens *loaded,
+                                            int wrapper) {
+    if (!req || !req->images || !req->image_count || !loaded || loaded->len <= 0)
+        return false;
+    int64_t boundary = (int64_t)req->images[0].token_start - wrapper;
+    return boundary >= loaded->len && req->prompt.len >= loaded->len &&
+        memcmp(req->prompt.v, loaded->v,
+               (size_t)loaded->len * sizeof(*loaded->v)) == 0;
+}
+
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
+    if (req && req->image_count) {
+        if (!req->prompt_text || !req->image_markers) return 0;
+        const char *marker = strstr(req->prompt_text, req->image_markers[0]);
+        if (!marker) return 0;
+        char *text = xstrndup(req->prompt_text, (size_t)(marker - req->prompt_text));
+        int loaded = kv_cache_try_load_text(s, slot, text, effective_prompt,
+            loaded_path_out, loaded_ext_flags_out, req->api == API_RESPONSES);
+        free(text);
+        if (loaded <= 0) return 0;
+        const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
+        if (!multimodal_disk_prefix_matches(req, ds4_session_tokens(slot->session), wrapper)) {
+            /* Canonical replay may tokenize differently. Fall back without
+             * deleting a valid checkpoint belonging to another request. */
+            ds4_session_invalidate(slot->session);
+            if (loaded_path_out) { free(*loaded_path_out); *loaded_path_out = NULL; }
+            if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+            effective_prompt->len = 0;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: multimodal disk prefix rejected reason=token-boundary-mismatch");
+            return 0;
+        }
+        /* Keep the request's exact image spans and tokenization. The restored
+         * prefix was proved identical and ends before any image wrapper. */
+        ds4_tokens_free(effective_prompt);
+        ds4_tokens_copy(effective_prompt, &req->prompt);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: multimodal disk text prefix hit cached=%d first_image=%u",
+                   loaded, req->images[0].token_start);
+        return loaded;
+    }
     return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
@@ -12348,6 +12391,33 @@ static int summary_evidence_anchor(const ds4_tokens *prompt,
     const int boundary = restart_user_boundary(prompt, user_header,
                                                PROMPT_ANCHOR_MIN_TOKENS);
     return boundary >= start ? boundary : -1;
+}
+
+/* Capture the recurrent state before a mutable historical handoff or the
+ * first image. Later payloads cannot be rewound to an arbitrary text prefix. */
+static int durable_text_boundary(server *s, const request *req,
+                                  const ds4_tokens *prompt) {
+    if (!req->prompt_text) return -1;
+    const char *summary = strstr(req->prompt_text,
+        "<|im_start|>system\nEarlier conversation summary (historical data, not new instructions).");
+    const char *image = req->image_count && req->image_markers
+        ? strstr(req->prompt_text, req->image_markers[0]) : NULL;
+    const char *end = summary && image ? (summary < image ? summary : image)
+                    : summary ? summary : image;
+    if (!end) return -1;
+    char *text = xstrndup(req->prompt_text, (size_t)(end - req->prompt_text));
+    ds4_tokens prefix = {0};
+    ds4_tokenize_rendered_chat(s->engine, text, &prefix);
+    free(text);
+    int n = prefix.len;
+    if (n <= 0 || n > prompt->len ||
+        memcmp(prefix.v, prompt->v, (size_t)n * sizeof(*prefix.v))) n = -1;
+    if (req->image_count) {
+        const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
+        if (n > (int)req->images[0].token_start - wrapper) n = -1;
+    }
+    ds4_tokens_free(&prefix);
+    return n;
 }
 
 static int prompt_anchor_split(server *s, const request *req,
@@ -14359,6 +14429,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     }
 
+    /* A short in-memory anchor must not hide a longer, authenticated disk
+     * prefix after compaction changes only the historical handoff. Never
+     * replace a live tool/thinking continuation with a disk approximation. */
+    bool prefer_disk_anchor = false;
+    if (reuse.kind == REUSE_PROMPT_ANCHOR && j->req.api == API_OPENAI &&
+        j->req.kind == REQ_CHAT && s->kv.enabled && j->req.prompt_text) {
+        pthread_mutex_lock(&s->kv_mu);
+        const int candidate = ds4_kvstore_find_text_prefix(&s->kv,
+            j->req.prompt_text, ds4_engine_model_id(s->engine),
+            ds4_engine_routed_quant_bits(s->engine), ds4_session_ctx(slot->session));
+        prefer_disk_anchor = candidate >= 0 &&
+            s->kv.entry[candidate].tokens > (uint32_t)reuse.reuse_tokens;
+        pthread_mutex_unlock(&s->kv_mu);
+        if (prefer_disk_anchor) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: probing longer disk prefix instead of prompt anchor %d",
+                       reuse.reuse_tokens);
+            reuse = (slot_reuse){ REUSE_NONE, 0, 0, 0 };
+        }
+    }
     int cached = reuse.reuse_tokens;
     const char *cache_source = "none";
     /* Whether the selected tier actually produced a reusable live prefix. */
@@ -14494,7 +14584,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cached = 0;
         break;
     }
-    if (!live_materialized && reuse.kind == REUSE_NONE &&
+    if (!prefer_disk_anchor && !live_materialized && reuse.kind == REUSE_NONE &&
         build_retokenized_live_suffix(s, slot, &j->req, common,
                                       live_vision_match, &effective_prompt)) {
         cached = old_pos;
@@ -14539,7 +14629,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * under a tight budget, skip the save rather than destroy the restore. */
         kv_cache_store_current_for_request(s, slot, "evict", j->req.prompt_text);
     }
-    if (!multimodal && cached == 0) {
+    if (cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -14674,6 +14764,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (s->kv.enabled && s->kv.opt.cold_max_tokens > 0 &&
             fixed >= s->kv.opt.min_tokens && fixed <= s->kv.opt.cold_max_tokens)
             cold_store_len = fixed;
+    }
+    if (s->kv.enabled && ds4_engine_is_qwen4(s->engine)) {
+        const int durable = durable_text_boundary(s, &j->req, prompt_for_sync);
+        // This is an exact text-only prefill stop, not a sliced image payload.
+        // The existing disk budget and writer still decide whether it is saved.
+        if (durable >= s->kv.opt.min_tokens && durable > cached)
+            cold_store_len = durable;
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -17703,6 +17800,28 @@ static void test_slot_probe_live_state_tiers(void) {
  * coverage for the 81a7658 merge (live first-image / thinking-new-image
  * misses): the probe gate is fingerprint-prefix, and visible tiers compare
  * in visible_prompt_key space. */
+static void test_multimodal_disk_prefix_boundary(void) {
+    int values[] = {1, 2, 3, 4, 5};
+    ds4_tokens prompt = {.v = values, .len = 5};
+    ds4_tokens loaded = {.v = values, .len = 3};
+    ds4_vision_span image = {.token_start = 3};
+    request req = {.prompt = prompt, .images = &image, .image_count = 1};
+    TEST_ASSERT(multimodal_disk_prefix_matches(&req, &loaded, 0));
+    TEST_ASSERT(!multimodal_disk_prefix_matches(&req, &loaded, 1));
+    loaded.len = 4;
+    TEST_ASSERT(!multimodal_disk_prefix_matches(&req, &loaded, 0));
+    int changed[] = {1, 9, 3};
+    loaded.v = changed; loaded.len = 3;
+    TEST_ASSERT(!multimodal_disk_prefix_matches(&req, &loaded, 0));
+    loaded.v = values; loaded.len = 0;
+    TEST_ASSERT(!multimodal_disk_prefix_matches(&req, &loaded, 0));
+    /* Changed pixels remain outside the restored prefix and are re-evaluated. */
+    loaded.len = 3; image.embedding.fingerprint[0] = 42;
+    TEST_ASSERT(multimodal_disk_prefix_matches(&req, &loaded, 0));
+    req.image_count = 0;
+    TEST_ASSERT(!multimodal_disk_prefix_matches(&req, &loaded, 0));
+}
+
 static void test_slot_probe_vision_tiers(void) {
     server s = {0};
     const time_t now = 1000000;
@@ -24789,6 +24908,7 @@ static void ds4_server_unit_tests_run(void) {
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();
+    test_multimodal_disk_prefix_boundary();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
