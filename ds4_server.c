@@ -13570,6 +13570,16 @@ static const char *empty_reply_continuation_suffix(void) {
            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 }
 
+/* Mirror only the forced assistant thinking boundary from the recovery prompt.
+ * The private first attempt stays private; recovery instructions never enter
+ * the client output. Keep streaming cursors on the same append-only buffer. */
+static void close_empty_reply_thinking(buf *text, thinking_state *thinking) {
+    if (!thinking->inside) return;
+    static const char boundary[] = "</think>\n\n";
+    buf_puts(text, boundary);
+    thinking_state_feed(thinking, boundary, sizeof(boundary) - 1);
+}
+
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
@@ -15753,7 +15763,12 @@ resume_empty_reply:
                 /* Retain the text buffer and streaming cursors: already-sent
                  * reasoning must not be repeated, and the new answer/tool call
                  * must remain in the same streamed assistant message. */
-                thinking.inside = false;
+                close_empty_reply_thinking(&text, &thinking);
+                dsml_decode_tracker_init(&dsml_tracker);
+                dsml_tracker.model_syntax = j->req.model_syntax;
+                dsml_tracker.pos = text.len;
+                tool_scan_from = text.len;
+                stop_scan_from = text.len;
                 tool_scan_waiting_for_think_close = false;
                 finish = "length";
                 stop_detail = "output limit";
@@ -23133,6 +23148,65 @@ static void test_empty_qwen_reply_gate(void) {
     request_free(&r);
 }
 
+static void test_empty_reply_recovery_thinking_boundary(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.think_mode = DS4_THINK_LOW;
+    r.has_tools = true;
+    r.stream = true;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) { request_free(&r); return; }
+    openai_stream stream;
+    openai_stream_start(&r, &stream);
+    buf text = {0};
+    buf_puts(&text, "Private first attempt.");
+    thinking_state thinking = {.inside = true};
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "recovery", &stream,
+                                         text.ptr, text.len, false));
+    close_empty_reply_thinking(&text, &thinking);
+    TEST_ASSERT(!thinking.inside);
+    size_t closed_len = text.len;
+    close_empty_reply_thinking(&text, &thinking);
+    TEST_ASSERT(text.len == closed_len);
+    buf_puts(&text, "Recovered answer.");
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "recovery", &stream,
+                                         text.ptr, text.len, false));
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_qwen_generated_message_ex(text.ptr, true,
+                                                &content, &reasoning, &calls, NULL));
+    TEST_ASSERT(content && !strcmp(content, "Recovered answer."));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "Private first attempt."));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "recovery", &stream,
+                                       text.ptr, text.len, &calls, "stop", 20, 10));
+    shutdown(sv[0], SHUT_WR);
+    char *wire = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(wire, "Recovered answer.") != NULL);
+    TEST_ASSERT(strstr(wire, "\"content\":\"Private") == NULL);
+    TEST_ASSERT(strstr(wire, "</think>") == NULL);
+    TEST_ASSERT(strstr(wire, "data: [DONE]") != NULL);
+    free(wire); free(content); free(reasoning);
+    tool_calls_free(&calls);
+    content = reasoning = NULL;
+    text.len = 0; text.ptr[0] = 0;
+    buf_puts(&text, "<think>Private tool planning.");
+    thinking = (thinking_state){.inside = true};
+    close_empty_reply_thinking(&text, &thinking);
+    buf_puts(&text, "<tool_call><function=lookup><parameter=query>example</parameter></function></tool_call>");
+    TEST_ASSERT(parse_qwen_generated_message_ex(text.ptr, true,
+                                                &content, &reasoning, &calls, NULL));
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "lookup"));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "Private tool planning."));
+    TEST_ASSERT(!content || !strstr(content, "Private tool planning."));
+    free(content); free(reasoning); tool_calls_free(&calls);
+    openai_stream_free(&stream); buf_free(&text);
+    close(sv[0]); close(sv[1]); request_free(&r);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -25204,6 +25278,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_empty_qwen_reply_gate();
+    test_empty_reply_recovery_thinking_boundary();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
