@@ -814,6 +814,8 @@ typedef struct {
     bool model_from_request;
     /* App-owned background summaries never replace the foreground checkpoint. */
     bool atomic_summary;
+    /* Opt-in foreground reserve; legacy OpenAI clients keep their old boundary. */
+    int atomic_output_reserve;
     uint64_t history_summary_hash;
     stop_list stops;
     char *raw_body;
@@ -4453,6 +4455,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "atomic_output_reserve")) {
+            if (!json_int(&p, &r->atomic_output_reserve) || r->atomic_output_reserve < 0 || r->atomic_output_reserve > 65536) { free(key); goto bad; }
         } else if (!strcmp(key, "atomic_summary")) {
             if (!json_bool(&p, &r->atomic_summary)) { free(key); goto bad; }
         } else if (!strcmp(key, "model")) {
@@ -7271,7 +7275,11 @@ static bool request_exceeds_context(const request *r, int ctx_size) {
     /* ds4_session_sync() rejects prompt->len >= ctx_size because generation
      * needs at least one free context slot.  Catch the same boundary here so
      * clients get a normal protocol error instead of a later backend failure. */
-    return r && r->prompt.len >= ctx_size;
+    if (!r) return false;
+    int reserve = r->atomic_summary ? 0 : r->atomic_output_reserve;
+    if (reserve > r->max_tokens && r->max_tokens > 0) reserve = r->max_tokens;
+    return r->prompt.len >= ctx_size ||
+           (reserve > 0 && (int64_t)r->prompt.len + reserve > ctx_size);
 }
 
 static bool http_error_context_length_exceeded(int fd, bool enable_cors,
@@ -7283,6 +7291,9 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
     snprintf(msg, sizeof(msg),
              "Prompt has %d tokens, but the configured context size is %d tokens",
              n_prompt_tokens, ctx_size);
+    if (r && r->atomic_output_reserve > 0 && !r->atomic_summary)
+        snprintf(msg, sizeof(msg), "Prompt has %d tokens plus %d reserved output tokens, but the configured context size is %d tokens",
+                 n_prompt_tokens, r->max_tokens > 0 && r->max_tokens < r->atomic_output_reserve ? r->max_tokens : r->atomic_output_reserve, ctx_size);
 
     if (r && r->api == API_ANTHROPIC) {
         buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
@@ -11885,6 +11896,24 @@ static const char *cache_diag_text_region(const char *text, size_t boundary) {
     return region;
 }
 
+/* Distinguish volatile system events without logging their contents. Role
+ * alone cannot tell a changed summary from a tool catalog or fixed policy. */
+static const char *cache_diag_message_kind(const char *text, size_t boundary) {
+    const char *start = text, *p = text;
+    while ((p = strstr(p, "<|im_start|>")) && (size_t)(p - text) <= boundary) {
+        start = p + strlen("<|im_start|>");
+        p = start;
+    }
+    if (strncmp(start, "system\n", 7)) return "non-system";
+    start += 7;
+    if (!strncmp(start, ATOMIC_HISTORY_SUMMARY_LABEL, strlen(ATOMIC_HISTORY_SUMMARY_LABEL)))
+        return "historical-summary";
+    if (!strncmp(start, "# Tools", 7)) return "tool-catalog";
+    if (!strncmp(start, ATOMIC_COMPLETION_REVIEW_LABEL, strlen(ATOMIC_COMPLETION_REVIEW_LABEL)))
+        return "completion-review";
+    return "system-policy";
+}
+
 /* Report only structural offsets, never private prompt contents. */
 static size_t cache_diag_message_index(const char *text, size_t boundary) {
     size_t count = 0;
@@ -11909,6 +11938,7 @@ static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
         const char *reason = "diagnostic-size-limit";
         size_t common = 0, message_index = 0;
         const char *saved_region = "unknown", *input_region = "unknown";
+        const char *saved_kind = "unknown", *input_kind = "unknown";
         if (e->text_bytes <= 8u * 1024u * 1024u) {
             FILE *fp = fopen(e->path, "rb");
             ds4_kvstore_entry header = {0};
@@ -11924,6 +11954,8 @@ static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
                     message_index = cache_diag_message_index(text, common);
                     saved_region = cache_diag_text_region(text, common);
                     input_region = cache_diag_text_region(prompt, common);
+                    saved_kind = cache_diag_message_kind(text, common);
+                    input_kind = cache_diag_message_kind(prompt, common);
                 }
                 free(text);
             }
@@ -11936,10 +11968,10 @@ static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
             kc->reject_different_quant && e->quant_bits != quant_bits ? "quant-mismatch" :
             (int)e->tokens < kc->opt.min_tokens ? "below-minimum" : "eligible";
         server_log(DS4_LOG_KVCACHE,
-                   "[cache-diag] event=disk-candidate key=%.40s tokens=%u selected_tokens=%d saved_bytes=%llu input_bytes=%zu common_bytes=%zu message_index=%zu saved_region=%s input_region=%s reason=%s eligibility=%s model=%u ctx=%u quant=%u",
+                   "[cache-diag] event=disk-candidate key=%.40s tokens=%u selected_tokens=%d saved_bytes=%llu input_bytes=%zu common_bytes=%zu message_index=%zu saved_region=%s input_region=%s reason=%s eligibility=%s model=%u ctx=%u quant=%u saved_kind=%s input_kind=%s",
                    e->sha, e->tokens, loaded, (unsigned long long)e->text_bytes,
                    pn, common, message_index, saved_region, input_region, reason, eligibility,
-                   e->model_id, e->ctx_size, e->quant_bits);
+                   e->model_id, e->ctx_size, e->quant_bits, saved_kind, input_kind);
     }
 }
 
@@ -14473,6 +14505,142 @@ static bool history_cache_enabled(void) {
     return !setting || !strcmp(setting, "1");
 }
 
+/* Diagnose the aligned retained-history boundary before compaction mutates
+ * live tokens. Counts and structural regions only; never emit message text. */
+static void history_cache_log_boundary(ds4_engine *engine, int slot,
+        const ds4_tokens *old, const ds4_tokens *next, history_cache_plan plan) {
+    if (!plan.length) return;
+    const int old_end = plan.source + plan.length;
+    const int next_end = plan.prefix + plan.length;
+    const int back = plan.length < 512 ? plan.length : 512;
+    const char *regions[2] = {"unavailable", "unavailable"};
+    const ds4_tokens *inputs[2] = {old, next};
+    const int ends[2] = {old_end, next_end};
+    for (int i = 0; i < 2; i++) {
+        int count = inputs[i]->len - (ends[i] - back);
+        if (count > back + 128) count = back + 128;
+        ds4_tokens window = {.v = inputs[i]->v + ends[i] - back, .len = count};
+        ds4_tokens before = {.v = window.v, .len = back};
+        size_t bytes = 0, offset = 0;
+        char *text = render_tokens_text(engine, &window, &bytes);
+        char *prefix = render_tokens_text(engine, &before, &offset);
+        if (text && prefix) regions[i] = diagnostic_tail_region(text, bytes, offset);
+        free(text); free(prefix);
+    }
+    fprintf(stderr, "[history-cache-boundary] slot=%d old_end=%d next_end=%d old_remaining=%d next_remaining=%d stop=%s old_region=%s next_region=%s\n",
+        slot, old_end, next_end, old->len - old_end, next->len - next_end,
+        old_end == old->len ? "live-exhausted" :
+        next_end == next->len ? "prompt-exhausted" : "token-mismatch",
+        regions[0], regions[1]);
+}
+
+/* Restart counterpart of live history compaction. Only an explicit Personal
+ * summary permits approximate reuse; authenticate the file and recheck exact
+ * payload tokens before moving graph rows. Never delete rejected snapshots. */
+static int kv_cache_try_load_history(server *s, server_slot *slot, request *req,
+                                    ds4_tokens *effective, char **path_out) {
+    if (!history_cache_enabled() || !s->dedicated_summary_slot || !s->kv.enabled ||
+        req->kind != REQ_CHAT || req->api != API_OPENAI || req->atomic_summary ||
+        req->image_count || !req->history_summary_hash || !req->prompt_text) return 0;
+    const int fixed = prompt_system_run_for_request(s, req, &req->prompt);
+    if (fixed < 1) return 0;
+    pthread_mutex_lock(&s->inference_mu);
+    pthread_mutex_lock(&s->kv_mu);
+    ds4_kvstore *kc = &s->kv;
+    const int model = ds4_engine_model_id(s->engine);
+    const int quant = ds4_engine_routed_quant_bits(s->engine);
+    const int ctx = ds4_session_ctx(slot->session);
+    /* Refresh the index and retain the exact-prefix result as a lower bound. */
+    int exact = ds4_kvstore_find_text_prefix(kc, req->prompt_text, model, quant, ctx);
+    int best = exact >= 0 ? (int)kc->entry[exact].tokens : 0;
+    char *chosen = NULL;
+    char chosen_sha[41] = {0};
+    for (int i = 0; i < kc->len; i++) {
+        ds4_kvstore_entry *e = &kc->entry[i];
+        if (e->model_id != model || e->ctx_size > (uint32_t)ctx ||
+            e->quant_bits != quant || e->tokens < (uint32_t)kc->opt.min_tokens ||
+            !e->text_bytes || e->text_bytes > 16 * 1024 * 1024 ||
+            (e->ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE)) continue;
+        FILE *fp = fopen(e->path, "rb");
+        ds4_kvstore_entry hdr = {0}; uint32_t bytes = 0;
+        if (!fp) continue;
+        bool valid = ds4_kvstore_read_header(fp, &hdr, &bytes) && bytes == e->text_bytes;
+        char *text = valid ? xmalloc((size_t)bytes + 1) : NULL;
+        if (valid) valid = fread(text, 1, bytes, fp) == bytes;
+        fclose(fp);
+        if (valid) {
+            text[bytes] = 0;
+            char sha[41]; ds4_kvstore_sha1_bytes_hex(text, bytes, sha);
+            valid = !strcmp(sha, e->sha) && strlen(text) == bytes;
+        }
+        if (valid) {
+            ds4_tokens tokens = {0};
+            ds4_tokenize_rendered_chat(s->engine, text, &tokens);
+            history_cache_plan plan = history_cache_match(&tokens, &req->prompt,
+                ds4_token_turn_start(s->engine), fixed);
+            server_log(DS4_LOG_DEFAULT,
+                "[history-cache-candidate] slot=%d snapshot_tokens=%u prefix=%d retained=%d source=%d reuse=%d previous_best=%d selected=%d",
+                slot->id, hdr.tokens, plan.prefix, plan.length, plan.source,
+                plan.length ? plan.prefix + plan.length : 0, best,
+                plan.length && plan.prefix + plan.length > best);
+            if (plan.length && plan.prefix + plan.length > best) {
+                best = plan.prefix + plan.length;
+                free(chosen); chosen = xstrdup(e->path);
+                memcpy(chosen_sha, e->sha, sizeof(chosen_sha));
+            }
+            ds4_tokens_free(&tokens);
+        }
+        free(text);
+    }
+    int loaded = 0;
+    if (chosen) {
+        FILE *fp = fopen(chosen, "rb");
+        ds4_kvstore_entry hdr = {0}; uint32_t bytes = 0;
+        char err[160] = {0};
+        bool valid = fp && ds4_kvstore_read_header(fp, &hdr, &bytes) &&
+            hdr.model_id == model && hdr.quant_bits == quant && hdr.ctx_size <= (uint32_t)ctx;
+        char *text = valid && bytes <= 16 * 1024 * 1024 ? xmalloc((size_t)bytes + 1) : NULL;
+        valid = valid && text && fread(text, 1, bytes, fp) == bytes;
+        if (valid) {
+            char sha[41]; ds4_kvstore_sha1_bytes_hex(text, bytes, sha);
+            valid = !strcmp(sha, chosen_sha);
+        }
+        if (valid && ds4_session_has_vision_state(slot->session))
+            ds4_session_invalidate(slot->session);
+        if (valid && ds4_session_load_payload(slot->session, fp, hdr.payload_bytes,
+                                               err, sizeof(err)) == 0) {
+            const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+            history_cache_plan plan = history_cache_match(tokens, &req->prompt,
+                ds4_token_turn_start(s->engine), fixed);
+            /* Inspect authenticated payload tokens before compaction changes
+             * them, exactly as for live-history reuse. */
+            history_cache_log_boundary(s->engine, slot->id,
+                tokens, &req->prompt, plan);
+            if (tokens && tokens->len == (int)hdr.tokens && plan.length &&
+                ds4_session_history_compact(slot->session, plan.prefix, plan.source,
+                                            plan.source + plan.length)) {
+                loaded = plan.prefix + plan.length;
+                ds4_tokens_free(effective);
+                ds4_tokenize_rendered_chat(s->engine, req->prompt_text, effective);
+                ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+                if (hooks.load && (hdr.ext_flags & hooks.ext_flag))
+                    hooks.load(hooks.ud, fp, hooks.load_wanted);
+                ds4_kvstore_touch_file(chosen, hdr.hits + 1);
+                if (path_out) *path_out = xstrdup(chosen);
+                server_log(DS4_LOG_DEFAULT,
+                    "[history-cache] source=disk approximate=1 prefix=%d retained=%d source=%d cached=%d file=%s",
+                    plan.prefix, plan.length, plan.source, loaded, chosen);
+            } else ds4_session_invalidate(slot->session);
+        } else if (valid) ds4_session_invalidate(slot->session);
+        free(text);
+        if (fp) fclose(fp);
+    }
+    free(chosen);
+    pthread_mutex_unlock(&s->kv_mu);
+    pthread_mutex_unlock(&s->inference_mu);
+    return loaded;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -14532,6 +14700,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         const history_cache_plan plan = history_cache_match(
             ds4_session_tokens(slot->session), &j->req.prompt,
             ds4_token_turn_start(s->engine), fixed);
+        history_cache_log_boundary(s->engine, slot->id,
+            ds4_session_tokens(slot->session), &j->req.prompt, plan);
         if (plan.length && ds4_session_checkpoint_valid(slot->session))
             history_compacted = ds4_session_history_compact(slot->session,
                 plan.prefix, plan.source, plan.source + plan.length);
@@ -14767,12 +14937,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         kv_cache_store_current_for_request(s, slot, "evict", j->req.prompt_text);
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
+        disk_cached = kv_cache_try_load_history(s, slot, &j->req,
+                                                &effective_prompt, &disk_cache_path);
+        const bool disk_history = disk_cached > 0;
+        if (!disk_history) disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
         if (disk_cached > 0) {
             cached = disk_cached;
-            cache_source = "disk-text";
+            cache_source = disk_history ? "disk-history" : "disk-text";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -18571,6 +18744,23 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
     r.prompt.len = 16;
     TEST_ASSERT(request_exceeds_context(&r, 16));
     TEST_ASSERT(!request_exceeds_context(&r, 17));
+    r.atomic_output_reserve = 8;
+    TEST_ASSERT(request_exceeds_context(&r, 23));
+    TEST_ASSERT(!request_exceeds_context(&r, 24));
+    r.max_tokens = 2;
+    TEST_ASSERT(!request_exceeds_context(&r, 18));
+    r.atomic_summary = true;
+    TEST_ASSERT(!request_exceeds_context(&r, 17));
+    r.atomic_summary = false;
+    r.atomic_output_reserve = 2048;
+    r.max_tokens = 4096;
+    r.prompt.len = 65457;
+    TEST_ASSERT(request_exceeds_context(&r, 65536));
+    r.prompt.len = 63488;
+    TEST_ASSERT(!request_exceeds_context(&r, 65536));
+    r.prompt.len = 16;
+    r.max_tokens = 128;
+    r.atomic_output_reserve = 0;
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -22803,6 +22993,14 @@ static void test_cache_candidate_diagnostics_boundaries(void) {
     TEST_ASSERT(cache_diag_message_index(a, common) == 1);
     TEST_ASSERT(cache_diag_message_index(a, strlen(a)) == 2);
     TEST_ASSERT(cache_diag_message_index("plain", 3) == 0);
+    TEST_ASSERT(!strcmp(cache_diag_message_kind(a, common), "system-policy"));
+    TEST_ASSERT(!strcmp(cache_diag_message_kind(a, strlen(a)), "non-system"));
+    const char *summary = "<|im_start|>system\n" ATOMIC_HISTORY_SUMMARY_LABEL " private";
+    TEST_ASSERT(!strcmp(cache_diag_message_kind(summary, strlen(summary)), "historical-summary"));
+    const char *tools = "<|im_start|>system\n# Tools\nprivate";
+    TEST_ASSERT(!strcmp(cache_diag_message_kind(tools, strlen(tools)), "tool-catalog"));
+    const char *review = "<|im_start|>system\n" ATOMIC_COMPLETION_REVIEW_LABEL;
+    TEST_ASSERT(!strcmp(cache_diag_message_kind(review, strlen(review)), "completion-review"));
 }
 
 static void test_model_metadata_clamps_completion_to_context(void) {

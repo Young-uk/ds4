@@ -286,3 +286,23 @@ send `"temperature": 0` or a `seed`.
 
 Compare variants in alternating runs: on a Mac in use, tokens per second of
 a single run moves by 1 to 2 percent.
+
+### Personal disk history recovery (2026-11-05)
+
+A labeled historical-summary request can now look for retained conversation
+segments in compatible disk snapshots before falling back to exact-prefix
+restoration. This uses the same approximate recurrent-state semantics as live
+history compaction: removed history may still influence recurrent state. It is
+not exact KV reuse under a rewritten prefix.
+
+Only text-only OpenAI chat requests with an explicit historical-summary label
+and the dedicated summary slot are eligible. Candidate text hashes, model,
+quantization, context capacity, and actual payload tokens are checked before
+compaction. At least one fresh token must be evaluated. Rejected snapshots are
+preserved. Images, summary computation, and Responses requests retain their
+existing restore paths. Approximate graph snapshots are still not serialized;
+a later restart may therefore restore an earlier exact snapshot.
+
+Model-backed regression: `tests/test_qwen4_disk_history_restart.py` uses a
+separate synthetic cache, shuts down before removing earlier turns, then checks
+both disk-history restoration and the next live follow-up.
