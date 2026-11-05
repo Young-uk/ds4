@@ -60837,6 +60837,7 @@ typedef struct {
 } ds4_vision_identity;
 
 struct ds4_session {
+    bool history_approximate; /* Diagnostic retained-history KV; never serialize as exact. */
     ds4_engine *engine;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
@@ -63307,6 +63308,10 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows) {
 }
 
 static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (s->history_approximate) {
+        payload_set_err(err, errlen, "diagnostic history cache is memory-only");
+        return 1;
+    }
     if (!s->qwen4_graph_ready || s->qwen4_rewound ||
         s->qwen4_graph.pos != (uint32_t)s->checkpoint.len) {
         payload_set_err(err, errlen, "Qwen3.8 snapshot requires sync or eval after rewind");
@@ -63492,6 +63497,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         s->checkpoint.len = 0;
         return 1;
     }
+    s->history_approximate = false;
     g->pos = rows;
     g->mtp_pos = mtp_rows;
     token_vec_free(&s->checkpoint);
@@ -75937,6 +75943,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
         if (s->checkpoint_valid &&
+            !(s->history_approximate && s->sync_image_count) &&
             s->qwen4_graph.pos == (uint32_t)s->checkpoint.len &&
             (!s->qwen4_rewound || prompt->len > s->checkpoint.len) &&
             prompt->len >= s->checkpoint.len &&
@@ -75944,6 +75951,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             start = s->checkpoint.len;
         } else {
             qwen4_graph_reset(&s->qwen4_graph);
+            s->history_approximate = false;
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
         }
@@ -85817,6 +85825,7 @@ void ds4_session_invalidate(ds4_session *s) {
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
     }
+    s->history_approximate = false;
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
@@ -85834,6 +85843,78 @@ void ds4_session_invalidate(ds4_session *s) {
     ds4_session_glm_reset_dense_cache(s);
 #endif
 }
+
+bool ds4_session_history_approximate(const ds4_session *s) {
+    return s && s->history_approximate;
+}
+
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_NO_GPU)
+static bool history_move_rows(ds4_gpu_tensor *t, int dst, int src, int rows,
+                      size_t stride, unsigned char *scratch, size_t cap) {
+    size_t bytes = (size_t)rows * stride;
+    for (size_t off = 0; off < bytes;) {
+        size_t n = bytes - off < cap ? bytes - off : cap;
+        if (!ds4_gpu_tensor_read(t, (uint64_t)src * stride + off, scratch, n) ||
+            !ds4_gpu_tensor_write(t, (uint64_t)dst * stride + off, scratch, n)) return false;
+        off += n;
+    }
+    return true;
+}
+
+bool ds4_session_history_compact(ds4_session *s, int first, int end, int keep_end) {
+    if (!s || s->engine->backend != DS4_BACKEND_METAL || !ds4_session_is_qwen4(s) || !s->checkpoint_valid ||
+        s->checkpoint_image_count || s->sync_image_count || s->distributed ||
+        ds4_session_tp_leader(s) || first < 0 || end <= first ||
+        end >= keep_end || keep_end > s->checkpoint.len) return false;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    if (!s->qwen4_graph_ready || g->pos != (uint32_t)s->checkpoint.len) return false;
+    const int n = s->checkpoint.len, tail = keep_end - end, removed = n - first - tail;
+    if ((int64_t)g->mrope_delta + removed > INT32_MAX) return false;
+    if (!ds4_gpu_synchronize()) return false;
+    const size_t cap = 1024 * 1024;
+    unsigned char *scratch = xmalloc(cap);
+    bool ok = history_move_rows(g->pos3, first, end, tail, 16, scratch, cap);
+    const ds4_model *m = &s->engine->model;
+    const ds4_weights *w = &s->engine->weights;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER - DS4_N_NEXTN_PREDICT; il++) {
+        if (!g->layer_k_cache[il]) continue; /* recurrent layers retain state */
+        const size_t kv_stride = (size_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2;
+        ok = history_move_rows(g->layer_k_cache[il], first, end, tail, kv_stride, scratch, cap) &&
+             history_move_rows(g->layer_v_cache[il], first, end, tail, kv_stride, scratch, cap) &&
+             history_move_rows(g->layer_ik_cache[il], first, end, tail,
+                       DS4_N_INDEXER_HEAD_DIM * sizeof(float), scratch, cap);
+        /* Removing a non-aligned interval changes four-token index blocks. */
+        const uint32_t blocks = (n - removed) / 4;
+        if (ok && blocks) ok = ds4_gpu_qwen4_idx_block_key_tensor(
+            g->layer_block_key[il], g->layer_ik_cache[il], g->pos3, m->map, m->size,
+            w->layer[il].indexer_k_norm->abs_offset, 0, blocks, 4,
+            DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+    }
+    free(scratch);
+    if (!ok || !ds4_gpu_synchronize()) { ds4_session_invalidate(s); return false; }
+    memmove(s->checkpoint.v + first, s->checkpoint.v + end, (size_t)tail * sizeof(int));
+    s->checkpoint.len = first + tail;
+    g->pos -= removed;
+    g->mrope_delta += removed; /* future tokens follow the old absolute frontier */
+    g->snap_valid = g->snap2_valid = g->snap0_valid = g->anchor_valid = false;
+    g->mtp_pos = 0;
+    g->mtp_last_rows = 0;
+    s->mtp_draft_valid = false;
+    s->glm_mtp_have = 0;
+    s->glm_mtp_have2 = false;
+    s->history_approximate = true;
+    s->qwen4_rewound = false;
+    /* The retained final hidden state is stale under exact semantics, but is
+     * intentionally retained here. Evaluate a new token before sampling. */
+    return true;
+}
+
+#else
+bool ds4_session_history_compact(ds4_session *s, int first, int end, int keep_end) {
+    (void)s; (void)first; (void)end; (void)keep_end;
+    return false;
+}
+#endif
 
 /* Qwen3.8 cannot rewind its GDN layers, so a prompt that shares only part of
  * the live transcript would otherwise be replayed from token zero.  The server

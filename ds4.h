@@ -590,6 +590,14 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
+/* Diagnostic approximation: keep [0, first) and [end, keep_end), retaining
+ * recurrent history and absolute rotary positions. Not exact recomputation.
+ * Text-only Metal Qwen; invalid ranges leave the session unchanged. The caller
+ * must sync at least one new token before sampling, disable MTP for this
+ * session, and must not persist this graph as an exact replay checkpoint. */
+bool ds4_session_history_compact(ds4_session *s, int first, int end, int keep_end);
+bool ds4_session_history_approximate(const ds4_session *s);
+
 /* Keep the token prefix, restoring recurrent state where possible. Otherwise
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */

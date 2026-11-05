@@ -814,6 +814,7 @@ typedef struct {
     bool model_from_request;
     /* App-owned background summaries never replace the foreground checkpoint. */
     bool atomic_summary;
+    uint64_t history_summary_hash;
     stop_list stops;
     char *raw_body;
     char *prompt_text;
@@ -4566,6 +4567,14 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         free(tool_schemas);
         request_free(r);
         return false;
+    }
+    /* Detect a real historical handoff change, not an ordinary cache miss. */
+    for (int i = 0; i < msgs.len; i++) {
+        if (!qwen_historical_summary(&msgs.v[i])) continue;
+        uint64_t hash = r->history_summary_hash ? r->history_summary_hash : UINT64_C(14695981039346656037);
+        for (const unsigned char *p = (const unsigned char *)msgs.v[i].content; *p; p++)
+            hash = (hash ^ *p) * UINT64_C(1099511628211);
+        r->history_summary_hash = (hash ^ 0xff) * UINT64_C(1099511628211);
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
@@ -10327,6 +10336,8 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    bool history_request_seen;
+    uint64_t history_summary_hash;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
     time_t last_used;
@@ -11633,6 +11644,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const char *cache_text_key,
                                             const char *restore_prompt) {
     if (!s || !slot) return false;
+    if (ds4_session_history_approximate(slot->session)) return false;
     /* Summaries are disposable computation, not conversation checkpoints. */
     if (s->dedicated_summary_slot && slot->id == s->slot_count - 1) return false;
     char err[160] = {0};
@@ -13268,9 +13280,16 @@ static int request_context_limit(const server *s, const request *r) {
         ? ATOMIC_SUMMARY_CONTEXT : s->ctx_size;
 }
 
+/* Called only under model_mu. Keep background work paused for the whole
+ * foreground request, including gaps between its token submissions. */
+static bool foreground_request_active(const server *s) {
+    return s->dedicated_summary_slot && s->slots[0].running &&
+        !job_cancelled(s->slots[0].running);
+}
+
 static bool summary_decode_must_yield(const server *s, int slot_id) {
     return s->dedicated_summary_slot && slot_id > 0 &&
-        (s->slots[0].decode_pending || s->slots[0].prefill_waiting);
+        (foreground_request_active(s) || s->slots[0].decode_pending || s->slots[0].prefill_waiting);
 }
 
 /* Summary decoding is greedy: verify each MTP draft with the base model.
@@ -13302,7 +13321,8 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (s->model_busy || (s->decode_pending > 0 && server_prefill_waits_for_decode(s, slot)) ||
-            server_next_prefill_slot_locked(s) != slot->id)) {
+            server_next_prefill_slot_locked(s) != slot->id ||
+            (slot->id > 0 && foreground_request_active(s)))) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
     if (g_stop_requested || slot_job_cancelled(slot)) {
@@ -14362,7 +14382,11 @@ static void *decode_worker_main(void *arg) {
             }
             if (!speculative) plain_count = count;
         }
-        if (count == 0) continue;
+        if (count == 0) {
+            // Yield the scheduler mutex so foreground prefill/decode can enter.
+            pthread_cond_wait(&s->model_cv, &s->model_mu);
+            continue;
+        }
         s->model_busy = true;
         pthread_mutex_unlock(&s->model_mu);
 
@@ -14414,6 +14438,41 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
+/* Personal history reuse: old recurrent influence deliberately survives
+ * removed history. Never infer this mode from a generic cache miss. */
+typedef struct { int prefix, source, length; } history_cache_plan;
+static history_cache_plan history_cache_match(const ds4_tokens *old,
+                                              const ds4_tokens *next,
+                                              int turn_start, int fixed) {
+    history_cache_plan best = {0};
+    if (!old || !next || fixed < 1 || fixed >= next->len || fixed >= old->len ||
+        memcmp(old->v, next->v, (size_t)fixed * sizeof(int))) return best;
+    int common = fixed;
+    while (common < old->len && common < next->len && old->v[common] == next->v[common]) common++;
+    int prefix = common;
+    while (prefix > fixed && (prefix >= next->len || next->v[prefix] != turn_start)) prefix--;
+    if (prefix >= next->len || next->v[prefix] != turn_start) return best;
+    /* A long seed bounds comparison cost even with repeated turn markers. */
+    const int seed = 32, minimum = 512;
+    if (next->len - prefix <= minimum) return best;
+    for (int source = prefix + 1; source + minimum <= old->len; source++) {
+        if (old->v[source] != turn_start ||
+            memcmp(old->v + source, next->v + prefix, seed * sizeof(int))) continue;
+        int count = seed;
+        while (source + count < old->len && prefix + count < next->len &&
+               old->v[source + count] == next->v[prefix + count]) count++;
+        /* Always prefill at least one new token before sampling stale logits. */
+        if (count >= minimum && prefix + count < next->len && count > best.length)
+            best = (history_cache_plan){prefix, source, count};
+    }
+    return best;
+}
+
+static bool history_cache_enabled(void) {
+    const char *setting = getenv("DS4_ATOMIC_HISTORY_CACHE");
+    return !setting || !strcmp(setting, "1");
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -14462,6 +14521,25 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * execution and routing can never disagree.  Tier order and conditions
      * live in slot_probe_reuse_locked(); below we only materialize the tier
      * the probe selected. */
+    bool history_compacted = false;
+    if (history_cache_enabled() && s->dedicated_summary_slot &&
+        slot->history_request_seen && j->req.kind == REQ_CHAT &&
+        j->req.api == API_OPENAI && !j->req.atomic_summary && !multimodal &&
+        j->req.history_summary_hash &&
+        j->req.history_summary_hash != slot->history_summary_hash) {
+        const int fixed = prompt_system_run_for_request(s, &j->req, &j->req.prompt);
+        pthread_mutex_lock(&s->inference_mu);
+        const history_cache_plan plan = history_cache_match(
+            ds4_session_tokens(slot->session), &j->req.prompt,
+            ds4_token_turn_start(s->engine), fixed);
+        if (plan.length && ds4_session_checkpoint_valid(slot->session))
+            history_compacted = ds4_session_history_compact(slot->session,
+                plan.prefix, plan.source, plan.source + plan.length);
+        pthread_mutex_unlock(&s->inference_mu);
+        fprintf(stderr, "[history-cache] slot=%d approximate=%d prefix=%d retained=%d source=%d old=%d new=%d\n",
+            slot->id, history_compacted, plan.prefix, plan.length, plan.source,
+            old_pos, j->req.prompt.len);
+    }
     slot_reuse reuse = slot_probe_reuse(s, slot, &j->req);
 
     if (responses_protocol &&
@@ -14592,7 +14670,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     case REUSE_MEMORY_TOKEN:
         live_materialized = true;
-        cache_source = "memory-token";
+        cache_source = history_compacted ? "history-approximate" : "memory-token";
         break;
     case REUSE_THINKING_VISIBLE:
         if (!build_live_prompt_suffix(s, slot, &j->req,
@@ -14889,7 +14967,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            if (!job_cancelled(j)) kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
             free(disk_cache_path);
             if (job_cancelled(j)) {
                 request_live_state_clear(s, slot);
@@ -14970,7 +15048,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        if (!job_cancelled(j)) kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
         free(disk_cache_path);
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
@@ -15188,7 +15266,7 @@ resume_empty_reply:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        if (!s->batched_mode && !ds4_session_history_approximate(slot->session) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -15209,7 +15287,7 @@ resume_empty_reply:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && request_batch_mtp_enabled(s, &j->req, temperature) &&
+        } else if (s->batched_mode && !ds4_session_history_approximate(slot->session) && request_batch_mtp_enabled(s, &j->req, temperature) &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -16036,6 +16114,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    if (!j->req.atomic_summary && j->req.api == API_OPENAI) {
+        slot->history_request_seen = ds4_session_checkpoint_valid(slot->session);
+        slot->history_summary_hash = j->req.history_summary_hash;
+    }
+
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
@@ -17503,6 +17586,10 @@ static void test_summary_slot_routing(void) {
     TEST_ASSERT(!summary_decode_must_yield(&s, 0));
     slots[0].decode_pending = false;
     TEST_ASSERT(!summary_decode_must_yield(&s, 1));
+    slots[0].running = &j;
+    TEST_ASSERT(summary_decode_must_yield(&s, 1));
+    TEST_ASSERT(!summary_decode_must_yield(&s, 0));
+    slots[0].running = NULL;
     TEST_ASSERT(!server_prefill_waits_for_decode(&s, &slots[0]));
     TEST_ASSERT(server_prefill_waits_for_decode(&s, &slots[1]));
     TEST_ASSERT(job_required_slot_locked(&s, &j) == 0);
@@ -19896,6 +19983,27 @@ static void test_qwen_append_only_tools(void) {
     chat_msg bad = {.role = "system", .content = ATOMIC_TOOLS_MARKER "[]trailing"};
     TEST_ASSERT(!qwen_tools_update(&spoof) && !qwen_tools_update(&bad));
     free(before); free(after); free(same); chat_msgs_free(&msgs);
+}
+
+static void test_history_cache_match(void) {
+    int a[1500], b[1200];
+    for (int i = 0; i < 1500; i++) a[i] = 100 + i;
+    for (int i = 0; i < 1200; i++) b[i] = 8000 + i;
+    a[100] = a[400] = 7;
+    memcpy(b, a, 100 * sizeof(int));
+    memcpy(b + 100, a + 400, 700 * sizeof(int));
+    ds4_tokens old = {.v=a, .len=1500}, next = {.v=b, .len=1200};
+    history_cache_plan p = history_cache_match(&old, &next, 7, 100);
+    TEST_ASSERT(p.prefix == 100 && p.source == 400 && p.length == 700);
+    b[0]++;
+    TEST_ASSERT(history_cache_match(&old, &next, 7, 100).length == 0);
+    b[0]--;
+    b[500]++;
+    TEST_ASSERT(history_cache_match(&old, &next, 7, 100).length == 0);
+    b[500]--;
+    next.len = 800; /* No new token to replace stale logits. */
+    TEST_ASSERT(history_cache_match(&old, &next, 7, 100).length == 0);
+    TEST_ASSERT(history_cache_match(NULL, &next, 7, 100).length == 0);
 }
 
 static void test_qwen_historical_summary_stays_at_recorded_position(void) {
@@ -25162,6 +25270,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_reasoning_effort_levels();
     test_qwen_append_only_effort();
     test_qwen_append_only_tools();
+    test_history_cache_match();
     test_qwen_historical_summary_stays_at_recorded_position();
     test_qwen_completion_review_stays_after_interim();
     test_qwen_prospective_tool_preamble();
