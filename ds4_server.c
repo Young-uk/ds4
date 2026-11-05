@@ -11622,6 +11622,9 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+static int prompt_system_run_split(const ds4_tokens *prompt,
+                                    const ds4_tokens *header, int marker);
+
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
@@ -11652,6 +11655,28 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
             ds4_session_ctx(slot->session));
         if (idx >= 0) protected_path = xstrdup(s->kv.entry[idx].path);
     }
+    char *fixed_path = NULL;
+    /* A restored long payload does not include the in-memory anchor. Derive
+     * its independent disk key from the unchanged leading system run instead,
+     * so warm saves cannot evict the boundary needed by later summaries. */
+    ds4_tokens system_header = {0};
+    ds4_tokenize_rendered_chat(s->engine, "<|im_start|>system\n", &system_header);
+    const int fixed = prompt_system_run_split(tokens, &system_header,
+                                              ds4_token_turn_start(s->engine));
+    ds4_tokens_free(&system_header);
+    if (fixed >= s->kv.opt.min_tokens && fixed <= s->kv.opt.cold_max_tokens) {
+        ds4_tokens head = *tokens;
+        head.len = fixed;
+        char *fixed_text = render_tokens_text(s->engine, &head, NULL);
+        if (fixed_text) {
+            int idx = ds4_kvstore_find_text_prefix(&s->kv, fixed_text,
+                ds4_engine_model_id(s->engine), ds4_engine_routed_quant_bits(s->engine),
+                ds4_session_ctx(slot->session));
+            if (idx >= 0) fixed_path = xstrdup(s->kv.entry[idx].path);
+            free(fixed_text);
+        }
+    }
+    s->kv.protected_anchor_path = fixed_path;
     s->kv.protected_restore_path = protected_path;
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
@@ -11661,6 +11686,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
     s->kv.protected_restore_path = NULL;
+    s->kv.protected_anchor_path = NULL;
+    free(fixed_path);
     free(protected_path);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
@@ -12352,6 +12379,12 @@ static int prompt_fixed_disk_split(const ds4_tokens *prompt, int marker,
     if (!kc || !kc->enabled || kc->opt.cold_max_tokens <= 0) return 0;
     const int fixed = prompt_fixed_anchor_split(prompt, marker, leading_system);
     return fixed >= kc->opt.min_tokens && fixed <= kc->opt.cold_max_tokens ? fixed : 0;
+}
+
+/* Capture only at or ahead of live state. Qwen recurrent state cannot be
+ * reconstructed by truncating a checkpoint that has already passed it. */
+static bool fixed_prefix_capture_needed(int fixed, int cached, int durable, int held) {
+    return fixed > 0 && fixed >= cached && fixed < durable && held != fixed;
 }
 
 /* A chat may have several leading system turns (persona, tool metadata,
@@ -14771,7 +14804,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * are small and reusable. Persist that exact boundary before continuing,
      * rather than waiting for a shutdown-only full transcript checkpoint.
      * The existing minimum, maximum prefix size and disk budget still apply. */
-    if (!multimodal && cached == 0) {
+    if (!multimodal) {
         const char *header = "<|im_start|>system\n";
         const bool leading_system = j->req.prompt_text &&
             !strncmp(j->req.prompt_text, header, strlen(header));
@@ -14780,7 +14813,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_token_turn_start(s->engine), leading_system, &s->kv);
         if (s->kv.enabled && s->kv.opt.cold_max_tokens > 0 &&
             fixed >= s->kv.opt.min_tokens && fixed <= s->kv.opt.cold_max_tokens)
-            fixed_store_len = cold_store_len = fixed;
+        {
+            fixed_store_len = fixed;
+            // A warm recurrent payload cannot be sliced backwards safely.
+            if (fixed > cached || (fixed == cached &&
+                ds4_session_anchor_pos(slot->session) != fixed))
+                cold_store_len = fixed;
+        }
     }
     if (s->kv.enabled && ds4_engine_is_qwen4(s->engine)) {
         const int durable = durable_text_boundary(s, &j->req, prompt_for_sync);
@@ -14792,10 +14831,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     /* The durable dialogue boundary can replace cold_store_len. Preserve the
      * independent fixed-instruction checkpoint before advancing recurrent state;
      * a later payload cannot safely be sliced back to this boundary. */
-    if (fixed_store_len > cached && fixed_store_len < cold_store_len) {
+    /* Do not sync an already restored anchor to itself: equal-length sync of
+     * a rewound Qwen state intentionally rebuilds stale logits from scratch. */
+    if (fixed_prefix_capture_needed(fixed_store_len, cached, cold_store_len,
+                                    ds4_session_anchor_pos(slot->session))) {
         ds4_tokens fixed_head = *prompt_for_sync;
         fixed_head.len = fixed_store_len;
         if (server_session_sync(s, slot, &fixed_head, err, sizeof(err)) == 0) {
+            /* Keep the exact recurrent state in memory as well: the later
+             * durable stop otherwise advances past the only fixed boundary. */
+            slot_save_prompt_anchor(s, slot, &j->req, prompt_for_sync, fixed_store_len);
             if (kv_cache_store_live_prefix(s, slot, &fixed_head,
                                            fixed_store_len, "cold"))
                 server_log(DS4_LOG_KVCACHE,
@@ -14804,6 +14849,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
         /* The normal sync below owns failure reporting and cancellation. */
     }
+    if (fixed_store_len > 0 && cached > fixed_store_len &&
+        ds4_session_anchor_pos(slot->session) != fixed_store_len)
+        server_log(DS4_LOG_KVCACHE,
+                   "[cache-diag] event=fixed-memory-anchor-unavailable tokens=%d cached=%d reason=warm-checkpoint-past-boundary",
+                   fixed_store_len, cached);
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
         /* A cold checkpoint can land exactly on the continued-checkpoint
@@ -22677,6 +22727,13 @@ static void test_summary_evidence_anchor(void) {
 }
 
 static void test_fixed_prefix_prompt_anchor(void) {
+    TEST_ASSERT(fixed_prefix_capture_needed(4096, 0, 8192, -1));
+    TEST_ASSERT(fixed_prefix_capture_needed(4096, 2048, 8192, -1));
+    TEST_ASSERT(fixed_prefix_capture_needed(4096, 4096, 8192, -1));
+    TEST_ASSERT(!fixed_prefix_capture_needed(4096, 4096, 8192, 4096));
+    TEST_ASSERT(!fixed_prefix_capture_needed(4096, 5000, 8192, -1));
+    TEST_ASSERT(!fixed_prefix_capture_needed(0, 0, 8192, -1));
+    TEST_ASSERT(!fixed_prefix_capture_needed(4096, 0, 4096, -1));
     int tokens[4096] = {0};
     const int marker = 77;
     ds4_tokens prompt = {0};
@@ -23836,6 +23893,45 @@ static void test_kv_cache_eviction_preserves_pending_restore(void) {
     TEST_ASSERT(kv_cache_find_text_prefix(&kc,
         "real conversation checkpoint and next message", 2, 32768) >= 0);
     kc.protected_restore_path = NULL;
+    kv_cache_evict(&kc, NULL, kc.budget_bytes - 8, NULL);
+    TEST_ASSERT(access(path, F_OK) != 0);
+    kv_cache_close(&kc);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_preserves_fixed_anchor(void) {
+    char tmpl[] = "/tmp/ds4-kv-protected-anchor.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *text = "real conversation checkpoint";
+    test_kv_text_stub_file(dir, text, KV_REASON_COLD, 512, 0);
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    int idx = kv_cache_find_text_prefix(&kc,
+        "real conversation checkpoint and next message", 2, 32768);
+    TEST_ASSERT(idx >= 0);
+    if (idx < 0) { kv_cache_close(&kc); rmdir(dir); return; }
+    char *path = xstrdup(kc.entry[idx].path);
+    kc.budget_bytes = kc.entry[idx].file_size + 16;
+    kc.protected_anchor_path = path;
+    const char *other_sha = "1111111111111111111111111111111111111111";
+    test_kv_stub_file(dir, other_sha, KV_REASON_SHUTDOWN, 1024, 50,
+                     (uint64_t)time(NULL), 128);
+    char *other_path = path_join(dir,
+        "1111111111111111111111111111111111111111.kv");
+    /* The outgoing QA slot cannot evict the candidate, even when both
+     * snapshots cannot fit. Refreshing the index must preserve protection. */
+    kv_cache_evict(&kc, NULL, kc.budget_bytes - 8, NULL);
+    TEST_ASSERT(access(path, F_OK) == 0);
+    TEST_ASSERT(access(other_path, F_OK) != 0);
+    free(other_path);
+    TEST_ASSERT(kv_cache_find_text_prefix(&kc,
+        "real conversation checkpoint and next message", 2, 32768) >= 0);
+    kc.protected_anchor_path = NULL;
     kv_cache_evict(&kc, NULL, kc.budget_bytes - 8, NULL);
     TEST_ASSERT(access(path, F_OK) != 0);
     kv_cache_close(&kc);
@@ -25126,6 +25222,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_preserves_pending_restore();
+    test_kv_cache_eviction_preserves_fixed_anchor();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();

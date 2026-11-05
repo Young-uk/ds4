@@ -580,6 +580,8 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
         for (int i = 0; i < kc->len; i++) {
             if (kc->protected_restore_path && kc->entry[i].path &&
                 !strcmp(kc->protected_restore_path, kc->entry[i].path)) continue;
+            if (kc->protected_anchor_path && kc->entry[i].path &&
+                !strcmp(kc->protected_anchor_path, kc->entry[i].path)) continue;
             double score = ds4_kvstore_entry_eviction_score(
                 &kc->entry[i], live, now, incoming);
             if (victim < 0 || score < victim_score ||

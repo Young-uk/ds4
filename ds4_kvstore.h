@@ -70,6 +70,8 @@ typedef struct {
     uint64_t budget_bytes;
     /* Borrowed path, scoped by the caller's existing cache serialization. */
     const char *protected_restore_path;
+    /* Exact independent prompt anchor; never sacrifice it for a longer save. */
+    const char *protected_anchor_path;
     bool reject_different_quant;
     ds4_kvstore_options opt;
     int continued_last_store_tokens;
