@@ -473,6 +473,9 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
+/* Bind validated request image spans to an exact restored disk checkpoint. */
+bool ds4_session_restore_disk_vision(ds4_session *s,
+                                     const ds4_vision_span *images, size_t count);
 bool ds4_session_has_vision_state(const ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(

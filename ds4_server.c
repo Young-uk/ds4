@@ -11661,12 +11661,9 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
-    /* The payload contains image-conditioned KV rows, but the disk key and
-     * trailer do not contain image fingerprints. Never let generic image
-     * placeholder tokens become a cache hit for a different image.
-     * sync_image_count covers progress-callback writes during prefill;
-     * checkpoint_image_count covers completed sessions. */
-    if (ds4_session_has_vision_state(slot->session)) {
+    /* Only an authenticated vision key may address image-conditioned rows. */
+    if (ds4_session_has_vision_state(slot->session) &&
+        !(cache_text_ext & DS4_KVSTORE_EXT_VISION)) {
         pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
@@ -11975,6 +11972,24 @@ static void kv_cache_log_rejected_prefixes(const kv_disk_cache *kc,
     }
 }
 
+/* Use exact token IDs so a visible transcript with different sampled tokens
+ * cannot restore this checkpoint. Image identity lives in the same cache
+ * entry as the KV payload and shares its eviction lifecycle. */
+static char *multimodal_disk_key(const request *req) {
+    buf key = {0};
+    buf_printf(&key, "ds4-vision-v1:%zu:", req->image_count);
+    for (size_t i = 0; i < req->image_count; i++) {
+        const ds4_vision_span *image = &req->images[i];
+        buf_printf(&key, "%u:%u:", image->token_start, image->embedding.token_count);
+        for (size_t b = 0; b < sizeof(image->embedding.fingerprint); b++)
+            buf_printf(&key, "%02x", (unsigned)image->embedding.fingerprint[b]);
+        buf_putc(&key, ':');
+    }
+    for (int i = 0; i < req->prompt.len; i++)
+        buf_printf(&key, "%d,", req->prompt.v[i]);
+    return buf_take(&key);
+}
+
 static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
                                   ds4_tokens *effective_prompt,
@@ -11996,7 +12011,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
-                                           &hooks, responses_protocol);
+                                           &hooks, responses_protocol, false);
     kv_cache_log_rejected_prefixes(&s->kv, prompt_text, loaded,
                                   ds4_engine_model_id(s->engine),
                                   ds4_session_ctx(slot->session),
@@ -12011,7 +12026,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     return loaded;
 }
 
-/* Disk snapshots contain text-only state. Restore only the exact token prefix
+/* The text-only fallback restores only the exact token prefix
  * before the first image; image placeholders never authenticate image pixels. */
 static bool multimodal_disk_prefix_matches(const request *req,
                                             const ds4_tokens *loaded,
@@ -12029,6 +12044,31 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
     if (req && req->image_count) {
+        if (s->kv.enabled) {
+            char *key = multimodal_disk_key(req);
+            ds4_kvstore_load_result result = {0};
+            pthread_mutex_lock(&s->inference_mu);
+            pthread_mutex_lock(&s->kv_mu);
+            ds4_session_invalidate(slot->session);
+            int restored = ds4_kvstore_try_load_text(&s->kv, s->engine,
+                slot->session, key, NULL, &result, NULL, false, true);
+            const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+            if (restored > 0 && tokens && restored <= req->prompt.len &&
+                memcmp(tokens->v, req->prompt.v, (size_t)restored * sizeof(*tokens->v)) == 0 &&
+                ds4_session_restore_disk_vision(slot->session, req->images, req->image_count)) {
+                ds4_tokens_free(effective_prompt);
+                ds4_tokens_copy(effective_prompt, &req->prompt);
+                if (loaded_path_out && result.path) *loaded_path_out = xstrdup(result.path);
+            } else if (restored > 0) {
+                ds4_session_invalidate(slot->session);
+                restored = 0;
+            }
+            pthread_mutex_unlock(&s->kv_mu);
+            pthread_mutex_unlock(&s->inference_mu);
+            ds4_kvstore_load_result_free(&result);
+            free(key);
+            if (restored > 0) return restored;
+        }
         if (!req->prompt_text || !req->image_markers) return 0;
         const char *marker = strstr(req->prompt_text, req->image_markers[0]);
         if (!marker) return 0;
@@ -15249,6 +15289,21 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    else if (s->kv.enabled && prompt_for_sync->len >= s->kv.opt.min_tokens &&
+             (cached <= (int)j->req.images[j->req.image_count - 1].token_start ||
+              kv_cache_slot_continued_target(s, slot, prompt_for_sync->len) > 0) &&
+             prompt_for_sync->len == j->req.prompt.len &&
+             memcmp(prompt_for_sync->v, j->req.prompt.v,
+                    (size_t)prompt_for_sync->len * sizeof(*prompt_for_sync->v)) == 0 &&
+             ds4_session_vision_state_matches(slot->session, j->req.images,
+                                               j->req.image_count)) {
+        char *key = multimodal_disk_key(&j->req);
+        if (kv_cache_store_live_prefix_text(s, slot, prompt_for_sync,
+                prompt_for_sync->len, "continued", key,
+                DS4_KVSTORE_EXT_VISION, "vision-token-prefix", NULL))
+            kv_cache_slot_note_store(slot, prompt_for_sync->len);
+        free(key);
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -18164,6 +18219,29 @@ static void test_slot_probe_live_state_tiers(void) {
  * coverage for the 81a7658 merge (live first-image / thinking-new-image
  * misses): the probe gate is fingerprint-prefix, and visible tiers compare
  * in visible_prompt_key space. */
+static void test_multimodal_disk_identity(void) {
+    int values[] = {1, 2, 3, 4, 5};
+    ds4_vision_span image = {.token_start = 2, .embedding = {.token_count = 2}};
+    request req = {.prompt = {.v = values, .len = 4}, .images = &image, .image_count = 1};
+    char *saved = multimodal_disk_key(&req);
+    req.prompt.len = 5;
+    char *appended = multimodal_disk_key(&req);
+    TEST_ASSERT(!strncmp(appended, saved, strlen(saved)));
+    image.embedding.fingerprint[0] = 1;
+    char *different = multimodal_disk_key(&req);
+    TEST_ASSERT(strncmp(different, saved, strlen(saved)));
+    ds4_session *session = ds4_session_new_test_checkpoint(values, 4);
+    image.token_start = 3;
+    TEST_ASSERT(!ds4_session_restore_disk_vision(session, &image, 1));
+    image.token_start = 2;
+    TEST_ASSERT(ds4_session_restore_disk_vision(session, &image, 1));
+    TEST_ASSERT(ds4_session_vision_state_matches(session, &image, 1));
+    ds4_session_free_test_checkpoint(session);
+    free(saved);
+    free(appended);
+    free(different);
+}
+
 static void test_multimodal_disk_prefix_boundary(void) {
     int values[] = {1, 2, 3, 4, 5};
     ds4_tokens prompt = {.v = values, .len = 5};
@@ -25438,6 +25516,7 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();
     test_multimodal_disk_prefix_boundary();
+    test_multimodal_disk_identity();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();

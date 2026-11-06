@@ -1213,14 +1213,15 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     return false;
 }
 
-int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size) {
+static int find_disk_prefix(ds4_kvstore *kc, const char *prompt_text,
+                            int model_id, int quant_bits, int ctx_size, bool vision) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
+        if (((e->ext_flags & DS4_KVSTORE_EXT_VISION) != 0) != vision) continue;
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
@@ -1238,6 +1239,11 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     return best;
 }
 
+int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                 int model_id, int quant_bits, int ctx_size) {
+    return find_disk_prefix(kc, prompt_text, model_id, quant_bits, ctx_size, false);
+}
+
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
@@ -1245,7 +1251,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol) {
+                              bool responses_protocol, bool vision) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
@@ -1253,8 +1259,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
+    int idx = find_disk_prefix(kc, prompt_text, model_id, quant_bits,
+                               ds4_session_ctx(session), vision);
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
@@ -1271,7 +1277,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
     char *cached_text = NULL;
     if (header_ok) {
-        if (hdr.model_id != (uint8_t)model_id) {
+        if (((hdr.ext_flags & DS4_KVSTORE_EXT_VISION) != 0) != vision) {
+            header_ok = false;
+            fail_reason = "cached checkpoint kind mismatch";
+        } else if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
         } else if ((uint64_t)text_bytes > prompt_bytes) {
@@ -1305,7 +1314,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
-            if (effective_prompt) {
+            if (effective_prompt && !vision) {
                 /* The cache lookup was by bytes, but the graph state is still
                  * the exact token history stored in the payload.  Build the
                  * prompt from that exact history and tokenize only the text

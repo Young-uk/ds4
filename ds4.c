@@ -75649,6 +75649,22 @@ static bool ds4_session_vision_range_overlaps(
     return false;
 }
 
+static void set_checkpoint_images(ds4_session *s, const ds4_vision_span *images, size_t n);
+
+bool ds4_session_restore_disk_vision(ds4_session *s,
+                                     const ds4_vision_span *images, size_t count) {
+    if (!s || !s->checkpoint_valid || !images || !count ||
+        ds4_session_has_vision_state(s)) return false;
+    uint64_t end = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!images[i].embedding.token_count || images[i].token_start < end) return false;
+        end = (uint64_t)images[i].token_start + images[i].embedding.token_count;
+        if (end > (uint64_t)s->checkpoint.len) return false;
+    }
+    set_checkpoint_images(s, images, count);
+    return true;
+}
+
 static bool ds4_session_store_vision_identities(ds4_session *s) {
     ds4_vision_identity *copy = NULL;
     if (s->sync_image_count != 0) {
@@ -86058,8 +86074,8 @@ void ds4_session_free_test_checkpoint(ds4_session *s) {
     free(s);
 }
 
-void ds4_session_set_test_images(ds4_session *s,
-                                 const ds4_vision_span *images, size_t n) {
+static void set_checkpoint_images(ds4_session *s,
+                                  const ds4_vision_span *images, size_t n) {
     if (!s) return;
     free(s->checkpoint_images);
     s->checkpoint_images = NULL;
@@ -86075,6 +86091,11 @@ void ds4_session_set_test_images(ds4_session *s,
                sizeof(s->checkpoint_images[i].fingerprint));
     }
     s->checkpoint_image_count = n;
+}
+
+void ds4_session_set_test_images(ds4_session *s,
+                                 const ds4_vision_span *images, size_t n) {
+    set_checkpoint_images(s, images, n);
 }
 
 int ds4_session_ctx(ds4_session *s) {
