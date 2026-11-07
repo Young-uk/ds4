@@ -196,3 +196,18 @@ Atomic tool policy v3 requests real web tools for current weather, changing fact
 The 16K dedicated summary slot now uses base-model-verified MTP for temperature-zero summaries on Qwen Metal when MTP is enabled. Existing foreground sampling, SSD/CUDA paths, output limits and chat-priority scheduling are unchanged. Nonzero-temperature summaries retain plain decoding. This supersedes the earlier experimental note that summaries never use MTP.
 
 Server regression tests passed. Isolated port-8011 synthetic English/Korean summary A/B runs produced byte-identical complete JSON: MTP off/on end-to-end times were 6.424/4.304s and 6.700/6.411s respectively (109/126 output tokens). These short single-pair measurements are not long-context throughput guarantees. Trace logs recorded actual accepted/rejected drafts. An overlapping foreground request completed in 4.457s while the summary remained alive and completed in 8.461s. Production conversation/cache data was not used by these tests. Input-prefill acceleration, CUDA and SSD hardware performance were not validated by this server-routing-only change.
+
+## Explicit prefill workspace tuning (local experiment, 2026-11-07)
+
+`dstar serve --prefill-chunk N` exposes the existing server workspace cap without
+requiring raw argument forwarding. Flash-Next keeps its previous 2048 default;
+1024 is an opt-in memory/first-token-latency trade-off, not a decode speed claim.
+The context limit, model quantization, MTP acceptance rules and user caches are
+unchanged. With `DS4_METAL_MEMORY_REPORT=1`, Qwen session teardown now reports
+tracked tensor allocation high-water marks before freeing session resources.
+Those counters exclude some driver/model allocations and are not a complete
+Metal device memory peak. Test configurations must use isolated caches.
+
+Model-free launcher coverage is part of `make test-frontends`. It checks both
+model routes, the unchanged defaults, positive bounds, malformed values, and
+raw server argument forwarding without downloading or loading a model.

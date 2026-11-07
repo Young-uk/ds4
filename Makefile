@@ -1023,6 +1023,7 @@ tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 test-frontends: ds4_test ds4_agent_test test-web-recovery
 	./ds4_test --server
 	./ds4_agent_test
+	python3 tests/test_dstar_launcher.py
 
 .PHONY: test-web-recovery
 test-web-recovery: tests/test_web_recovery

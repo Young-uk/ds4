@@ -73959,6 +73959,12 @@ void ds4_session_free(ds4_session *s) {
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
                 qwen4_spec_timing_report();
             }
+#ifdef DS4_HAS_QWEN4_METAL
+            if (getenv("DS4_METAL_MEMORY_REPORT") != NULL && s->engine &&
+                s->engine->backend == DS4_BACKEND_METAL) {
+                ds4_gpu_print_memory_report("before Qwen3.8 session free");
+            }
+#endif
             free(s->qwen4_verify_logits);
             if (s->qwen4_slot >= 0 && s->engine) {
                 s->engine->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);

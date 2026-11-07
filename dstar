@@ -55,6 +55,7 @@ usage: dstar <command> [options]
                          memory, so 262k is its ceiling on 64 GB; iq3s is
                          IQ3_S, ISTA's best file, 16 GB more than q2, for
                          Macs with 96 GB or more
+      --prefill-chunk N  input workspace cap (default 2048 for Flash-Next)
       --port N           port (default $PORT)
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
@@ -311,10 +312,15 @@ serve_other() {
 }
 
 cmd_serve() {
-    local ctx="" mtp=1 vision=1 dry=0 model="" power=""
+    local ctx="" mtp=1 vision=1 dry=0 model="" power="" prefill=""
     while [ $# -gt 0 ]; do
         case $1 in
             --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
+            --prefill-chunk)
+                [ $# -ge 2 ] || die "--prefill-chunk needs a value"
+                case $2 in *[!0-9]*|""|0) die "--prefill-chunk needs a positive integer" ;; esac
+                [ ${#2} -le 5 ] && [ "$2" -gt 0 ] && [ "$2" -le 65536 ] || die "--prefill-chunk must be between 1 and 65536"
+                prefill=$2; shift ;;
             --port) [ $# -ge 2 ] || die "--port needs a value"; PORT=$2; shift ;;
             --lan) HOST=0.0.0.0 ;;
             --no-mtp) mtp=0 ;;
@@ -333,7 +339,10 @@ cmd_serve() {
     if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
     [ -n "$model" ] || model=$(default_model) || exit 1
-    if [ -n "$model" ]; then serve_other "$model" "$ctx" "$dry" "$@"; return; fi
+    if [ -n "$model" ]; then
+        [ -z "$prefill" ] || set -- --prefill-chunk "$prefill" "$@"
+        serve_other "$model" "$ctx" "$dry" "$@"; return
+    fi
     pick_quant
     locate_files
     [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the $QUANT model is not in $QDIR; run: $0 pull --quant $QUANT"
@@ -383,7 +392,7 @@ cmd_serve() {
 
     export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
     export DS4_QWEN4_MOE_TAILS=1
-    set -- --ctx "$ctx" --prefill-chunk 2048 --host "$HOST" --port "$PORT" \
+    set -- --ctx "$ctx" --prefill-chunk "${prefill:-2048}" --host "$HOST" --port "$PORT" \
         --kv-disk-dir "$kv_dir" --kv-disk-space-mb "$kv_mb" \
         --kv-cache-continued-interval-tokens "$kv_every" "$@"
     if [ "$mtp" = 1 ] && [ -f "$F_MTP" ]; then
