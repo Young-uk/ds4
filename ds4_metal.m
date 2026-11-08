@@ -54,6 +54,7 @@ enum {
     DS4_METAL_TENSOR_IQ3_S   = 21,
     DS4_METAL_TENSOR_IQ2_S   = 22,
     DS4_METAL_TENSOR_IQ4_XS  = 23,
+    DS4_METAL_TENSOR_IQ1_M   = 29,
     DS4_METAL_TENSOR_BF16    = 30,
     DS4_METAL_TENSOR_MXFP4   = 39,
     DS4_METAL_TENSOR_Q2_0    = 42,
@@ -48433,6 +48434,7 @@ enum {
     QWEN4_K_HC_GATE_MIX_BF16_ROWS,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT2,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT3,
+    QWEN4_K_MOE_MID_IQ1_M,
     QWEN4_K_MOE_MID_IQ2_XS,
     QWEN4_K_MOE_MID_IQ2_S,
     QWEN4_K_MOE_MID_IQ3_XXS,
@@ -48560,6 +48562,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_gate_mix_bf16_rows",
     "kernel_qwen4_hc_gate_mix_bf16_rows_nt2",
     "kernel_qwen4_hc_gate_mix_bf16_rows_nt3",
+    "kernel_qwen4_moe_mid_iq1_m",
     "kernel_qwen4_moe_mid_iq2_xs",
     "kernel_qwen4_moe_mid_iq2_s",
     "kernel_qwen4_moe_mid_iq3_xxs",
@@ -48749,6 +48752,7 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     case 8u:  return (in_dim / 32u) * 34u;   /* q8_0 */
     case 12u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 144u;   /* q4_K */
     case 10u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 84u;    /* q2_K */
+    case 29u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 56u;    /* iq1_m */
     case 16u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 66u;    /* iq2_xxs */
     case 39u: return (in_dim / 32u) * 17u;   /* mxfp4 */
     case 2u:  return (in_dim / 32u) * 18u;   /* q4_0 */
@@ -49876,7 +49880,8 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         return qwen4_dispatch(QWEN4_K_MOE_MID_Q2_0, &args, sizeof(args), b, 7,
                               MTLSizeMake((ff_dim + 7u) / 8u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
     }
-    const int grid_kernel = weight_type == DS4_METAL_TENSOR_IQ2_XS ? QWEN4_K_MOE_MID_IQ2_XS :
+    const int grid_kernel = weight_type == DS4_METAL_TENSOR_IQ1_M ? QWEN4_K_MOE_MID_IQ1_M :
+                            weight_type == DS4_METAL_TENSOR_IQ2_XS ? QWEN4_K_MOE_MID_IQ2_XS :
                             weight_type == DS4_METAL_TENSOR_IQ2_S ? QWEN4_K_MOE_MID_IQ2_S :
                             weight_type == DS4_METAL_TENSOR_IQ3_XXS ? QWEN4_K_MOE_MID_IQ3_XXS :
                             weight_type == DS4_METAL_TENSOR_IQ3_S ? QWEN4_K_MOE_MID_IQ3_S :
@@ -50068,7 +50073,7 @@ int ds4_gpu_qwen4_moe_build_lists_tensor(
 static bool qwen4_moe_mm_type_ok(uint32_t type) {
     return type == 8u || type == 39u || type == 12u || type == 10u || type == 16u || type == 2u || type == 42u ||
            type == DS4_METAL_TENSOR_IQ4_NL || type == DS4_METAL_TENSOR_IQ2_XS || type == DS4_METAL_TENSOR_IQ2_S ||
-           type == DS4_METAL_TENSOR_IQ3_XXS || type == DS4_METAL_TENSOR_IQ3_S || type == DS4_METAL_TENSOR_IQ4_XS;
+           type == DS4_METAL_TENSOR_IQ3_XXS || type == DS4_METAL_TENSOR_IQ3_S || type == DS4_METAL_TENSOR_IQ4_XS || type == DS4_METAL_TENSOR_IQ1_M;
 }
 
 static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens, bool mid) {

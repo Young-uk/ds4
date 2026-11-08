@@ -9,7 +9,7 @@ enum {
     Q_F32 = 0, Q_F16 = 1, Q_Q4_0 = 2, Q_Q5_0 = 6, Q_Q8_0 = 8, Q_Q3_K = 11,
     Q_Q4_K = 12, Q_Q5_K = 13, Q_Q6_K = 14, Q_IQ2_XS = 17, Q_IQ3_XXS = 18,
     Q_IQ4_NL = 20, Q_IQ3_S = 21, Q_IQ2_S = 22, Q_IQ4_XS = 23,
-    Q_BF16 = 30, Q_Q2_0 = 42,
+    Q_IQ1_M = 29, Q_BF16 = 30, Q_Q2_0 = 42,
 };
 
 #include "ds4_iq_grids.inc"
@@ -220,6 +220,35 @@ static void grid4x2(const uint32_t *g1, const uint32_t *g2, uint8_t signs, float
     grid8(grid, signs, dl, y);
 }
 
+/* IQ1_M: 32 grid-index bytes, 16 high-index/shift bytes and 8 scale bytes.
+ * CPU reference follows llama.cpp dequantize_row_iq1_m (MIT) at
+ * 80d2c0c2c56e4a1bbf74be98f64b99927bf230bc, using the signed-byte codebook. */
+static void deq_iq1_m(const uint8_t *b, float *y) {
+    uint16_t sc[4];
+    for (int i = 0; i < 4; i++) sc[i] = (uint16_t)(b[48 + 2*i] | (b[49 + 2*i] << 8));
+    const uint16_t bits = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                          ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    const float d = f16_to_f32(bits);
+    const uint8_t *qs = b, *qh = b + 32;
+    for (int ib = 0; ib < 8; ib++) {
+        const float dl[2] = {
+            d * (2*((sc[ib/2] >> (6*(ib%2))) & 7) + 1),
+            d * (2*((sc[ib/2] >> (6*(ib%2) + 3)) & 7) + 1),
+        };
+        for (int l = 0; l < 4; l++) {
+            const uint8_t high = qh[2*ib + l/2] >> (4*(l%2));
+            const uint16_t index = (uint16_t)(qs[4*ib + l] | ((high & 7) << 8));
+            const float delta = high & 8 ? -0.125f : 0.125f;
+            const uint64_t grid = iq1s_grid[index];
+            for (int j = 0; j < 8; j++) {
+                const uint8_t encoded = (uint8_t)(grid >> (8*j));
+                const int value = encoded < 128 ? encoded : (int)encoded - 256;
+                y[32*ib + 8*l + j] = dl[l/2] * (value + delta);
+            }
+        }
+    }
+}
+
 /* IQ2_XS: f16 d, u16 qs[32] (9-bit grid index, 7-bit sign index), scales[8]. */
 static void deq_iq2_xs(const uint8_t *b, float *y) {
     const float d = half_at(b);
@@ -298,6 +327,7 @@ static const quant_info quant_infos[] = {
     { Q_Q5_K,   256, 176, deq_q5_K },
     { Q_Q6_K,   256, 210, deq_q6_K },
     { Q_IQ4_XS, 256, 136, deq_iq4_xs },
+    { Q_IQ1_M,  256,  56, deq_iq1_m },
     { Q_IQ2_XS, 256,  74, deq_iq2_xs },
     { Q_IQ2_S,  256,  82, deq_iq2_s },
     { Q_IQ3_XXS,256,  98, deq_iq3_xxs },

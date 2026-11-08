@@ -2377,6 +2377,7 @@ enum {
     DS4_TENSOR_IQ4_XS   = 23,
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_IQ1_M    = 29,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
     DS4_TENSOR_Q2_0     = 42,
@@ -5705,7 +5706,11 @@ static void tensor_expect_qwen4_expert_layout(
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_is_routed_expert_type(t->type) &&
         t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32 &&
-        t->type != DS4_TENSOR_Q4_0 && !tensor_type_is_mixed_quant(t->type)) {
+        t->type != DS4_TENSOR_Q4_0 && !tensor_type_is_mixed_quant(t->type)
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        && t->type != DS4_TENSOR_IQ1_M
+#endif
+        ) {
         fprintf(stderr, "ds4: routed expert tensor %.*s has unsupported type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
@@ -58142,6 +58147,10 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
 /* The codebook quants of ISTA's IQ3_XXS file and the IQ4_XS of its IQ3_S
  * file: 256-weight blocks, gate/up only. */
 static bool qwen4_expert_type_is_grid(uint32_t type) {
+#ifdef __APPLE__
+    /* IQ1_M is implemented only for Metal routed gate/up weights. */
+    if (type == DS4_TENSOR_IQ1_M) return true;
+#endif
     return type == DS4_TENSOR_IQ2_XS || type == DS4_TENSOR_IQ2_S ||
            type == DS4_TENSOR_IQ3_XXS || type == DS4_TENSOR_IQ3_S ||
            type == DS4_TENSOR_IQ4_XS;
@@ -58224,9 +58233,10 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
             }
         }
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
-            !qwen4_graph_expert_ok(l->ffn_down_exps) || l->ffn_up_exps->type != l->ffn_gate_exps->type) {
+            !qwen4_graph_expert_ok(l->ffn_down_exps) || l->ffn_down_exps->type == DS4_TENSOR_IQ1_M ||
+            l->ffn_up_exps->type != l->ffn_gate_exps->type) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
-                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, iq4_nl, q2_0, f16, f32; "
+                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, iq4_nl, q2_0, f16, f32; iq1_m gate/up only; "
                     "gate and up must match)\n", il);
             return false;
         }

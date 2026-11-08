@@ -3417,6 +3417,7 @@ kernel void kernel_qwen4_moe_mid_grid(
 }
 
 typedef decltype(kernel_qwen4_moe_mid_grid<block_iq3_s, ds4q_dequantize_iq3_s>) qwen4_moe_mid_grid_t;
+template [[host_name("kernel_qwen4_moe_mid_iq1_m")]]  kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq1_m, ds4q_dequantize_iq1_m>;
 template [[host_name("kernel_qwen4_moe_mid_iq2_xs")]]  kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq2_xs, ds4q_dequantize_iq2_xs>;
 template [[host_name("kernel_qwen4_moe_mid_iq2_s")]]   kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq2_s, ds4q_dequantize_iq2_s>;
 template [[host_name("kernel_qwen4_moe_mid_iq3_xxs")]] kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq3_xxs, ds4q_dequantize_iq3_xxs>;
@@ -3845,7 +3846,7 @@ kernel void kernel_qwen4_moe_build_lists(
 /* The types that only have the 16-weight dequantizers of quants.metal:
  * IQ4_NL, IQ4_XS and the codebook quants. */
 static inline bool qwen4_mm_deq16_has(uint type) {
-    return type == 20 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
+    return type == 20 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23 || type == 29;
 }
 
 /* quarters q0 and q0 + 1 (q0 even) of 32-wide block b */
@@ -3857,6 +3858,7 @@ static inline void qwen4_mm_deq16(device const char *row, uint b, uint q0, uint 
     case 18: ds4q_dequantize_iq3_xxs((device const block_iq3_xxs *)row + sb, il, w); break;
     case 21: ds4q_dequantize_iq3_s((device const block_iq3_s *)row + sb, il, w); break;
     case 22: ds4q_dequantize_iq2_s((device const block_iq2_s *)row + sb, il, w); break;
+    case 29: ds4q_dequantize_iq1_m((device const block_iq1_m *)row + sb, il, w); break;
     case 23: ds4q_dequantize_iq4_xs((device const block_iq4_xs *)row + sb, il, w); break;
     default: ds4q_dequantize_iq4_nl((device const block_iq4_nl *)row + b, (short)(q0 / 2), w); break;
     }

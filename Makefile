@@ -677,7 +677,12 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
-.PHONY: test-qwen4-kernels test-qwen4-q2 test-qwen4-vision
+.PHONY: test-qwen4-kernels test-qwen4-q2 test-qwen4-vision test-qwen4-iq1-m
+
+# Small synthetic fixtures; no model load or running-server changes.
+test-qwen4-iq1-m: $(QWEN4_KERNEL_TEST)
+	DS4_TEST_QWEN4_IQ1_M=1 ./$(QWEN4_KERNEL_TEST)
+
 test-qwen4-kernels: $(QWEN4_KERNEL_TEST)
 	./$(QWEN4_KERNEL_TEST)
 

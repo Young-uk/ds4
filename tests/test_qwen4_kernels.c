@@ -1563,13 +1563,13 @@ static void test_attention_rows(arena_t *a) {
 /* IQ4_NL and the codebook quants: random block bytes with a sane scale, the
  * shadow comes from the CPU dequantizer. */
 static bool wtype_is_dequant(uint32_t wtype) {
-    return wtype == 20u || wtype == 17u || wtype == 18u || wtype == 21u || wtype == 22u || wtype == 23u;
+    return wtype == 20u || wtype == 17u || wtype == 18u || wtype == 21u || wtype == 22u || wtype == 23u || wtype == 29u;
 }
 
 static uint64_t arena_dequant(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     uint64_t row_bytes = 0;
     require_ok(ds4_quant_row_bytes(wtype, cols, &row_bytes), "quant row bytes");
-    const uint64_t block_bytes = wtype == 20u ? 18u : wtype == 17u ? 74u : wtype == 22u ? 82u : wtype == 18u ? 98u : wtype == 23u ? 136u : 110u;
+    const uint64_t block_bytes = wtype == 29u ? 56u : wtype == 20u ? 18u : wtype == 17u ? 74u : wtype == 22u ? 82u : wtype == 18u ? 98u : wtype == 23u ? 136u : 110u;
     const uint64_t off = arena_alloc(a, rows * row_bytes);
     uint8_t *w = a->base + off;
     float *deq = malloc(cols * sizeof(float));
@@ -1577,7 +1577,15 @@ static uint64_t arena_dequant(arena_t *a, uint32_t wtype, uint64_t rows, uint64_
     for (uint64_t i = 0; i < rows * row_bytes; i++) w[i] = (uint8_t)(frand() * 128.0f + 128.0f);
     for (uint64_t b = 0; b < rows * row_bytes / block_bytes; b++) {
         const uint16_t dh = f32_to_f16(scale * (0.5f + 0.5f * fabsf(frand())));
-        memcpy(w + b * block_bytes, &dh, 2);
+        if (wtype == 29u) {
+            /* IQ1_M's fp16 scale is split across four scale-word high nibbles. */
+            for (unsigned j = 0; j < 4; j++) {
+                uint16_t sc;
+                memcpy(&sc, w + b * block_bytes + 48 + 2 * j, 2);
+                sc = (sc & 0x0fffu) | (((dh >> (4 * j)) & 15u) << 12);
+                memcpy(w + b * block_bytes + 48 + 2 * j, &sc, 2);
+            }
+        } else memcpy(w + b * block_bytes, &dh, 2);
     }
     for (uint64_t r = 0; r < rows; r++) {
         require_ok(ds4_dequant_row(wtype, w + r * row_bytes, deq, cols), "cpu dequant");
@@ -1590,7 +1598,7 @@ static uint64_t arena_dequant(arena_t *a, uint32_t wtype, uint64_t rows, uint64_
 static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow) {
     /* the codes reach 127 (IQ4_NL), 127 * 31 (IQ4_XS) or 43 times the block scale */
     if (wtype_is_dequant(wtype))
-        return arena_dequant(a, wtype, rows, cols, shadow, wtype == 20u ? 0.0005f : wtype == 23u ? 0.00002f : 0.0002f);
+        return arena_dequant(a, wtype, rows, cols, shadow, wtype == 29u ? 0.02f : wtype == 20u ? 0.0005f : wtype == 23u ? 0.00002f : 0.0002f);
     if (wtype == 39u) return arena_mxfp4(a, rows, cols, shadow);
     if (wtype == 42u) return arena_q2_0(a, rows, cols, shadow, 0.05f);
     return wtype == 12u ? arena_q4_K(a, rows, cols, shadow, 0.05f) :
@@ -1707,7 +1715,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     double *gate_w, *up_w, *down_w, *sg_w, *su_w, *sd_w;
     uint64_t gate_off, up_off, down_off, sg_off, su_off, sd_off;
     const bool q8 = wtype != 0u;
-    const char *tier_name = wtype == 17u ? "iq2_xs" : wtype == 22u ? "iq2_s" : wtype == 18u ? "iq3_xxs" :
+    const char *tier_name = wtype == 29u ? "iq1_m" : wtype == 17u ? "iq2_xs" : wtype == 22u ? "iq2_s" : wtype == 18u ? "iq3_xxs" :
                             wtype == 21u ? "iq3_s" : wtype == 23u ? "iq4_xs" : wtype == 42u ? "q2_0" : wtype == 12u ? "q4_K" : wtype == 10u ? "q2_K" : wtype == 16u ? "iq2_xxs" : wtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     if (q8) {
         gate_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &gate_w);
@@ -3716,6 +3724,21 @@ int main(void) {
         test_half_expert_tiles(&arena,33,12,39,64);
         test_half_expert_tiles(&arena,2049,16,10,192);
         test_half_expert_tiles(&arena,2049,12,39,192);
+        return 0;
+    }
+#endif
+#ifdef __APPLE__
+    if (getenv("DS4_TEST_QWEN4_IQ1_M")) {
+        for (unsigned generic = 0; generic < 2; generic++) {
+            if (generic) setenv("DS4_QWEN4_NO_GRID_MOE", "1", 1);
+            else unsetenv("DS4_QWEN4_NO_GRID_MOE");
+            test_moe_types(&arena, 4, 2, 2560, 640, 1, 29u, 20u);
+            test_moe_types(&arena, 4, 2, 2560, 640, 2, 29u, 42u);
+            test_moe_types(&arena, 4, 2, 2560, 640, 33, 29u, 20u);
+            test_moe_types(&arena, 4, 2, 2560, 640, 100, 29u, 10u);
+        }
+        unsetenv("DS4_QWEN4_NO_GRID_MOE");
+        printf("all IQ1_M Qwen routed expert tests passed\n");
         return 0;
     }
 #endif
