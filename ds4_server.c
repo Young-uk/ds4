@@ -10509,6 +10509,7 @@ struct server {
     int active_generations;
     int mixed_prefill_quantum;
     int last_prefill_slot;
+    unsigned foreground_quanta; /* model_mu: saturating 8:1 compute-turn credit. */
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -13332,11 +13333,39 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
 
+/* Both prefill and decode use one decision under model_mu. The resident
+ * sessions never change owner or lose their cursor/KV state when yielding.
+ * Count compute turns, not tokens or wall time: MTP and prefill have different
+ * costs. A summary turn is bounded separately below. */
+#define ATOMIC_FOREGROUND_WEIGHT 8u
+#define ATOMIC_SUMMARY_PREFILL_QUANTUM 128
+
+static int server_next_priority_slot_locked(const server *s) {
+    if (!s || !s->dedicated_summary_slot || s->slot_count < 2) return -1;
+    const int summary = s->slot_count - 1;
+    const bool foreground_ready = s->slots[0].prefill_waiting || s->slots[0].decode_pending;
+    const bool summary_ready = s->slots[summary].prefill_waiting || s->slots[summary].decode_pending;
+    if (foreground_ready && (!summary_ready || s->foreground_quanta < ATOMIC_FOREGROUND_WEIGHT))
+        return 0;
+    if (summary_ready) return summary;
+    return -1;
+}
+
+static void server_record_priority_turn_locked(server *s, int slot_id) {
+    if (!s->dedicated_summary_slot) return;
+    if (slot_id == 0) {
+        if (s->foreground_quanta < ATOMIC_FOREGROUND_WEIGHT) s->foreground_quanta++;
+    } else if (slot_id == s->slot_count - 1) {
+        s->foreground_quanta = 0;
+    }
+}
+
 static int server_next_prefill_slot_locked(const server *s) {
     if (!s || s->slot_count <= 0) return -1;
-    /* Existing model-executor queue gives chat prefill the next quantum.
-     * Running GPU work is not interrupted; no additional mutex is needed. */
-    if (s->dedicated_summary_slot && s->slots[0].prefill_waiting) return 0;
+    if (s->dedicated_summary_slot) {
+        int id = server_next_priority_slot_locked(s);
+        return id >= 0 && s->slots[id].prefill_waiting ? id : -1;
+    }
     for (int n = 1; n <= s->slot_count; n++) {
         int id = (s->last_prefill_slot + n) % s->slot_count;
         if (s->slots[id].prefill_waiting) return id;
@@ -13352,29 +13381,18 @@ static int request_context_limit(const server *s, const request *r) {
         ? ATOMIC_SUMMARY_CONTEXT : s->ctx_size;
 }
 
-/* Called only under model_mu. Keep background work paused for the whole
- * foreground request, including gaps between its token submissions. */
-static bool foreground_request_active(const server *s) {
-    return s->dedicated_summary_slot && s->slots[0].running &&
-        !job_cancelled(s->slots[0].running);
-}
-
-static bool summary_decode_must_yield(const server *s, int slot_id) {
-    return s->dedicated_summary_slot && slot_id > 0 &&
-        (foreground_request_active(s) || s->slots[0].decode_pending || s->slots[0].prefill_waiting);
-}
-
 /* Summary decoding is greedy: verify each MTP draft with the base model.
  * Keep nonzero-temperature summaries and all existing chat sampling unchanged.
- * The executor still yields this resident slot to foreground GPU work. */
+ * The weighted executor retains this resident slot between compute turns. */
 static bool request_batch_mtp_enabled(const server *s, const request *r, float temperature) {
     return r->atomic_summary ? (s->qwen4_summary_mtp && temperature == 0.0f)
                              : s->qwen4_batch_mtp;
 }
 
 static bool server_prefill_waits_for_decode(const server *s, const server_slot *slot) {
-    // A queued summary token must not starve a newly arrived chat prompt.
-    return !(s->dedicated_summary_slot && slot->id == 0);
+    (void)slot;
+    /* The weighted policy already arbitrates both kinds of compute together. */
+    return !s->dedicated_summary_slot;
 }
 
 static bool server_prefill_enter(server *s, server_slot *slot) {
@@ -13393,8 +13411,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (s->model_busy || (s->decode_pending > 0 && server_prefill_waits_for_decode(s, slot)) ||
-            server_next_prefill_slot_locked(s) != slot->id ||
-            (slot->id > 0 && foreground_request_active(s)))) {
+            server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
     if (g_stop_requested || slot_job_cancelled(slot)) {
@@ -13405,6 +13422,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     }
     slot->prefill_waiting = false;
     s->last_prefill_slot = slot->id;
+    server_record_priority_turn_locked(s, slot->id);
     s->model_busy = true;
     pthread_mutex_unlock(&s->model_mu);
     pthread_mutex_lock(&s->inference_mu);
@@ -13431,11 +13449,15 @@ static int server_prefill_quantum_for(const server *s,
     return quantum;
 }
 
-static int server_prefill_quantum(server *s) {
+static int server_prefill_quantum(server *s, const server_slot *slot) {
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
     pthread_mutex_unlock(&s->model_mu);
-    return server_prefill_quantum_for(s, generation_active);
+    int quantum = server_prefill_quantum_for(s, generation_active);
+    /* Always bound the summary, even if chat arrives after this calculation. */
+    if (s->dedicated_summary_slot && slot->id == s->slot_count - 1 &&
+        quantum > ATOMIC_SUMMARY_PREFILL_QUANTUM) quantum = ATOMIC_SUMMARY_PREFILL_QUANTUM;
+    return quantum;
 }
 
 /* Synchronize one resident slot without monopolizing the model executor.  A
@@ -13462,9 +13484,7 @@ static int server_session_sync(server *s, server_slot *slot,
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
-        int quantum = server_prefill_quantum(s);
-        // Keep background GPU work bounded even before a foreground job arrives.
-        if (s->dedicated_summary_slot && slot->id == s->slot_count - 1 && quantum > 512) quantum = 512;
+        int quantum = server_prefill_quantum(s, slot);
         int target = done + quantum;
         if (target > prompt->len || target < done) target = prompt->len;
         if (target <= 0) target = prompt->len;
@@ -13533,7 +13553,7 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
     bool called = false;
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
-        int quantum = server_prefill_quantum(s);
+        int quantum = server_prefill_quantum(s, slot);
         int target = done + quantum;
         if (target > prompt->len || target < done) target = prompt->len;
         if (target <= 0) target = prompt->len;
@@ -14413,7 +14433,7 @@ static void *decode_worker_main(void *arg) {
         }
         if (s->decode_pending == 0 && s->model_stopping) break;
 
-        if (coalesce_us > 0 && s->decode_pending < s->slot_count) {
+        if (!s->dedicated_summary_slot && coalesce_us > 0 && s->decode_pending < s->slot_count) {
             struct timespec deadline;
             clock_gettime(CLOCK_REALTIME, &deadline);
             timespec_add_us(&deadline, coalesce_us);
@@ -14428,22 +14448,21 @@ static void *decode_worker_main(void *arg) {
             }
         }
 
-        while (s->model_busy ||
-               (s->dedicated_summary_slot && s->slots[0].prefill_waiting)) {
+        while (s->model_busy) {
             pthread_cond_wait(&s->model_cv, &s->model_mu);
         }
         if (s->model_stopping && s->decode_pending == 0) break;
 
         int count = 0, plain_count = 0;
+        const int priority_slot = server_next_priority_slot_locked(s);
         /* Keep sampled/exact requests out of the greedy speculative group. */
         for (int speculative = 0; speculative <= 1; speculative++) {
             for (int i = 0; i < s->slot_count; i++) {
                 server_slot *slot = &s->slots[i];
                 if (!slot->decode_pending || slot->decode_speculative != (bool)speculative) continue;
-                /* Never combine foreground speculation and background decode.
-                 * Foreground work wins at the next GPU scheduling boundary. */
-                if (summary_decode_must_yield(s, i) ||
-                    (s->dedicated_summary_slot && count > 0)) continue;
+                /* Never batch the two weighted lanes together. Prefill and
+                 * decode must obey the same choice or either can starve. */
+                if (s->dedicated_summary_slot && i != priority_slot) continue;
                 slot->decode_pending = false;
                 slot->decode_in_flight = true;
                 s->decode_pending--;
@@ -14459,6 +14478,7 @@ static void *decode_worker_main(void *arg) {
             pthread_cond_wait(&s->model_cv, &s->model_mu);
             continue;
         }
+        if (s->dedicated_summary_slot) server_record_priority_turn_locked(s, priority_slot);
         s->model_busy = true;
         pthread_mutex_unlock(&s->model_mu);
 
@@ -17416,6 +17436,10 @@ static server_config parse_options(int argc, char **argv) {
             exit(2);
         }
     }
+    if (c.dedicated_summary_slot && c.batched_sessions < 2) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --summary-slot requires at least 2 batched sessions");
+        exit(2);
+    }
     if (c.kv_cache.cold_max_tokens > 0 &&
         c.kv_cache.cold_max_tokens < c.kv_cache.min_tokens)
     {
@@ -17580,6 +17604,9 @@ int main(int argc, char **argv) {
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.qwen4_summary_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                          ds4_engine_is_qwen4(engine) && cfg.engine.glm_mtp;
+    if (s.dedicated_summary_slot)
+        server_log(DS4_LOG_DEFAULT, "ds4-server: summary scheduler=weighted-quanta-v1 foreground_weight=%u summary_weight=1 summary_prefill_quantum=%d resident_sessions_preserved=true",
+                   ATOMIC_FOREGROUND_WEIGHT, ATOMIC_SUMMARY_PREFILL_QUANTUM);
     if (s.qwen4_summary_mtp)
         server_log(DS4_LOG_DEFAULT, "ds4-server: greedy summary MTP verification enabled");
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
@@ -17809,17 +17836,16 @@ static void test_summary_slot_routing(void) {
     TEST_ASSERT(!request_batch_mtp_enabled(&s, &j.req, 0.0f));
     s.qwen4_batch_mtp = true;
     TEST_ASSERT(request_batch_mtp_enabled(&s, &j.req, 0.5f));
-    slots[0].decode_pending = true;
-    TEST_ASSERT(summary_decode_must_yield(&s, 1));
-    TEST_ASSERT(!summary_decode_must_yield(&s, 0));
+    slots[0].decode_pending = slots[1].decode_pending = true;
+    TEST_ASSERT(server_next_priority_slot_locked(&s) == 0);
     slots[0].decode_pending = false;
-    TEST_ASSERT(!summary_decode_must_yield(&s, 1));
+    /* A live foreground HTTP request is not a reason to pause the summary. */
     slots[0].running = &j;
-    TEST_ASSERT(summary_decode_must_yield(&s, 1));
-    TEST_ASSERT(!summary_decode_must_yield(&s, 0));
+    TEST_ASSERT(server_next_priority_slot_locked(&s) == 1);
     slots[0].running = NULL;
+    slots[1].decode_pending = false;
     TEST_ASSERT(!server_prefill_waits_for_decode(&s, &slots[0]));
-    TEST_ASSERT(server_prefill_waits_for_decode(&s, &slots[1]));
+    TEST_ASSERT(!server_prefill_waits_for_decode(&s, &slots[1]));
     TEST_ASSERT(job_required_slot_locked(&s, &j) == 0);
     j.req.atomic_summary = true;
     TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
@@ -17828,6 +17854,109 @@ static void test_summary_slot_routing(void) {
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == 0);
     slots[0].prefill_waiting = false;
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == 1);
+}
+
+/* Model-free checks cover every prefill/decode pairing and the actual
+ * prefill condition-variable path without loading a model or using a GPU. */
+static void test_summary_weighted_quanta(void) {
+    for (int fg_decode = 0; fg_decode < 2; fg_decode++) {
+        for (int bg_decode = 0; bg_decode < 2; bg_decode++) {
+            server_slot slots[2] = {{.id = 0}, {.id = 1}};
+            server s = {.slots = slots, .slot_count = 2, .dedicated_summary_slot = true};
+            slots[0].decode_pending = fg_decode;
+            slots[0].prefill_waiting = !fg_decode;
+            slots[1].decode_pending = bg_decode;
+            slots[1].prefill_waiting = !bg_decode;
+            int foreground = 0, summary = 0;
+            for (int n = 0; n < 900; n++) {
+                const int id = server_next_priority_slot_locked(&s);
+                TEST_ASSERT(id == (n % 9 == 8 ? 1 : 0));
+                TEST_ASSERT(server_next_prefill_slot_locked(&s) ==
+                            (slots[id].prefill_waiting ? id : -1));
+                if (id == 0) foreground++; else summary++;
+                server_record_priority_turn_locked(&s, id);
+            }
+            TEST_ASSERT(foreground == 800 && summary == 100);
+            /* No artificial delay when either lane has no queued compute. */
+            slots[0].prefill_waiting = slots[0].decode_pending = false;
+            for (int n = 0; n < 20; n++) {
+                TEST_ASSERT(server_next_priority_slot_locked(&s) == 1);
+                server_record_priority_turn_locked(&s, 1);
+            }
+            slots[0].decode_pending = true;
+            TEST_ASSERT(server_next_priority_slot_locked(&s) == 0);
+            slots[1].prefill_waiting = slots[1].decode_pending = false;
+            for (int n = 0; n < 20; n++) {
+                TEST_ASSERT(server_next_priority_slot_locked(&s) == 0);
+                server_record_priority_turn_locked(&s, 0);
+            }
+            TEST_ASSERT(s.foreground_quanta == ATOMIC_FOREGROUND_WEIGHT);
+            slots[1].prefill_waiting = true;
+            TEST_ASSERT(server_next_priority_slot_locked(&s) == 1);
+            /* Readiness changes/cancelled work cannot leave a stale grant. */
+            slots[1].prefill_waiting = false;
+            TEST_ASSERT(server_next_priority_slot_locked(&s) == 0);
+            slots[0].decode_pending = false;
+            TEST_ASSERT(server_next_priority_slot_locked(&s) == -1);
+        }
+    }
+}
+
+typedef struct {
+    server *s;
+    server_slot *slot;
+    int turns;
+    int completed;
+} priority_prefill_test;
+
+static void *test_priority_prefill_worker(void *arg) {
+    priority_prefill_test *t = arg;
+    for (int i = 0; i < t->turns; i++) {
+        if (!server_prefill_enter(t->s, t->slot)) break;
+        t->completed++;
+        server_prefill_leave(t->s);
+    }
+    return NULL;
+}
+
+static void test_summary_weighted_prefill_threads(void) {
+    server_slot slots[2] = {{.id = 0}, {.id = 1}};
+    server s = {.slots = slots, .slot_count = 2, .dedicated_summary_slot = true,
+                .batched_mode = true, .mixed_prefill_quantum = 2048};
+    pthread_mutex_init(&s.model_mu, NULL);
+    pthread_mutex_init(&s.inference_mu, NULL);
+    pthread_cond_init(&s.model_cv, NULL);
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == ATOMIC_SUMMARY_PREFILL_QUANTUM);
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[0]) == 2048);
+    s.active_generations = 1;
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == ATOMIC_SUMMARY_PREFILL_QUANTUM);
+    priority_prefill_test tasks[2] = {{&s, &slots[0], 800, 0}, {&s, &slots[1], 100, 0}};
+    pthread_t threads[2];
+    for (int i = 0; i < 2; i++) TEST_ASSERT(pthread_create(&threads[i], NULL, test_priority_prefill_worker, &tasks[i]) == 0);
+    for (int i = 0; i < 2; i++) pthread_join(threads[i], NULL);
+    TEST_ASSERT(tasks[0].completed == 800 && tasks[1].completed == 100);
+    TEST_ASSERT(!s.model_busy && !slots[0].prefill_waiting && !slots[1].prefill_waiting);
+    /* Client cancellation while the other lane owns compute must release
+     * only the waiting request, never reset either resident session. */
+    job j = {0};
+    pthread_mutex_init(&j.mu, NULL);
+    slots[1].running = &j;
+    TEST_ASSERT(server_prefill_enter(&s, &slots[0]));
+    priority_prefill_test cancelled = {&s, &slots[1], 1, 0};
+    TEST_ASSERT(pthread_create(&threads[1], NULL, test_priority_prefill_worker, &cancelled) == 0);
+    pthread_mutex_lock(&s.model_mu);
+    while (!slots[1].prefill_waiting) pthread_cond_wait(&s.model_cv, &s.model_mu);
+    job_mark_cancelled(&j);
+    pthread_cond_broadcast(&s.model_cv);
+    pthread_mutex_unlock(&s.model_mu);
+    pthread_join(threads[1], NULL);
+    TEST_ASSERT(cancelled.completed == 0 && !slots[1].prefill_waiting);
+    server_prefill_leave(&s);
+    slots[1].running = NULL;
+    pthread_mutex_destroy(&j.mu);
+    pthread_cond_destroy(&s.model_cv);
+    pthread_mutex_destroy(&s.inference_mu);
+    pthread_mutex_destroy(&s.model_mu);
 }
 
 static void test_batched_prefill_round_robin(void) {
@@ -25508,6 +25637,8 @@ static void ds4_server_unit_tests_run(void) {
     test_atomic_stream_preserves_http_errors_and_deduplicates();
     test_server_image_embedding_cache();
     test_summary_slot_routing();
+    test_summary_weighted_quanta();
+    test_summary_weighted_prefill_threads();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();

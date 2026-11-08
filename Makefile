@@ -101,6 +101,18 @@ ds4: ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_
 ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
+# Model-free scheduler qualification; deliberately separate from model tests.
+.PHONY: test-summary-scheduler
+test-summary-scheduler: ds4_server_test tests/test_summary_scheduler_fake
+	./ds4_server_test
+	./tests/test_summary_scheduler_fake
+
+ds4_server_test: ds4_server.c $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_SERVER_TEST -o $@ ds4_server.c ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+tests/test_summary_scheduler_fake: tests/test_summary_scheduler_fake.c ds4_server.c $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
+	$(CC) $(CFLAGS) -Wno-unused-function -o $@ tests/test_summary_scheduler_fake.c ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+
 ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
