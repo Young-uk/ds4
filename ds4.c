@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_history_payload.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -63318,8 +63319,12 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows) {
 }
 
 static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
-    if (s->history_approximate) {
-        payload_set_err(err, errlen, "diagnostic history cache is memory-only");
+    /* Version three labels approximate recurrent history explicitly. All tensor
+     * rows, absolute positions and mrope_delta already belong to this payload;
+     * ordinary version-two snapshots remain byte-for-byte unchanged. */
+    if (s->history_approximate && (s->engine->backend != DS4_BACKEND_METAL ||
+        s->checkpoint_image_count || s->sync_image_count || s->distributed)) {
+        payload_set_err(err, errlen, "approximate history snapshots require text-only Qwen Metal");
         return 1;
     }
     if (!s->qwen4_graph_ready || s->qwen4_rewound ||
@@ -63339,7 +63344,7 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
     }
     uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC,
-        DS4_SESSION_PAYLOAD_VERSION,
+        s->history_approximate ? DS4_SESSION_HISTORY_PAYLOAD_VERSION : DS4_SESSION_PAYLOAD_VERSION,
         (uint32_t)s->ctx_size,
         s->prefill_cap,
         g->ctx_cap,
@@ -63495,8 +63500,22 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         uint32_t v;
         rc = payload_read_u32(fp, &v, remaining, err, errlen);
         if (rc == 0) g->mrope_delta = (int32_t)v;
+        if (rc == 0 && h[1] == DS4_SESSION_HISTORY_PAYLOAD_VERSION &&
+            (g->mrope_delta < 0 || (uint64_t)rows + (uint32_t)g->mrope_delta > INT32_MAX)) {
+            payload_set_err(err, errlen, "invalid approximate history absolute frontier");
+            rc = 1;
+        }
     }
-    if (rc == 0) {
+    if (rc == 0 && h[1] == DS4_SESSION_HISTORY_PAYLOAD_VERSION) {
+        uint32_t *positions = xmalloc((size_t)rows * 16u);
+        rc = payload_read_bytes(fp, positions, (uint64_t)rows * 16u, remaining, err, errlen);
+        if (rc == 0 && !ds4_history_positions_valid(positions, rows, g->mrope_delta)) {
+            payload_set_err(err, errlen, "invalid approximate history text positions");
+            rc = 1;
+        }
+        if (rc == 0 && !ds4_gpu_tensor_write(g->pos3, 0, positions, (size_t)rows * 16u)) rc = 1;
+        free(positions);
+    } else if (rc == 0) {
         rc = payload_read_tensor_span(fp, g->pos3, 0, (uint64_t)rows * 16u,
                                       buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
     }
@@ -63507,7 +63526,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         s->checkpoint.len = 0;
         return 1;
     }
-    s->history_approximate = false;
+    s->history_approximate = h[1] == DS4_SESSION_HISTORY_PAYLOAD_VERSION;
     g->pos = rows;
     g->mtp_pos = mtp_rows;
     token_vec_free(&s->checkpoint);
@@ -63882,7 +63901,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || !ds4_history_payload_version_valid(h[1],
+        s->engine && ds4_session_is_qwen4(s) && s->engine->backend == DS4_BACKEND_METAL,
+        s->engine && s->engine->tp.active)) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
@@ -64495,6 +64516,74 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
     return 0;
+#endif
+}
+
+/* Use device blits instead of materializing a second full host payload. The
+ * serialized snapshot path remains the disk format authority; these spans are
+ * the same mutable state that qwen4_session_save_payload writes. */
+int ds4_session_clone_state(ds4_session *destination, ds4_session *source, char *err, size_t errlen) {
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_NO_GPU)
+    if (!destination || !source || destination == source || destination->engine != source->engine ||
+        !source->engine || source->engine->backend != DS4_BACKEND_METAL ||
+        !ds4_session_is_qwen4(source) || source->distributed || destination->distributed ||
+        source->engine->tp.active || !source->checkpoint_valid || source->checkpoint.len <= 0 ||
+        source->checkpoint_image_count || source->sync_image_count || source->qwen4_rewound ||
+        !source->qwen4_graph_ready || !destination->qwen4_graph_ready ||
+        source->qwen4_graph.pos != (uint32_t)source->checkpoint.len ||
+        source->checkpoint.len >= destination->ctx_size) {
+        payload_set_err(err, errlen, "incompatible cached-summary source or destination"); return 1;
+    }
+    ds4_qwen4_gpu_graph *src = &source->qwen4_graph, *dst = &destination->qwen4_graph;
+    uint32_t rows = (uint32_t)source->checkpoint.len;
+    if (rows > dst->ctx_cap || !ds4_gpu_synchronize()) {
+        payload_set_err(err, errlen, "cached-summary source does not fit or synchronize"); return 1;
+    }
+    ds4_session_invalidate(destination);
+    if (!ds4_gpu_begin_commands()) {
+        payload_set_err(err, errlen, "failed to open cached-summary copy command batch"); return 1;
+    }
+    bool ok = true;
+#define QWEN4_CLONE(field, bytes_) do { \
+    uint64_t count_ = (bytes_); \
+    if (count_ && (!src->field || !dst->field || \
+        !ds4_gpu_tensor_copy(dst->field, 0, src->field, 0, count_))) ok = false; \
+} while (0)
+    const uint32_t mtp_rows = src->mtp_pos < rows ? src->mtp_pos : rows;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4_layer_is_linear(il)) {
+            QWEN4_CLONE(layer_lin_state[il], qwen4_payload_lin_state_bytes());
+            QWEN4_CLONE(layer_lin_hist[il], qwen4_payload_lin_hist_bytes());
+        } else {
+            uint32_t count = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
+            QWEN4_CLONE(layer_k_cache[il], qwen4_payload_kv_bytes(count));
+            QWEN4_CLONE(layer_v_cache[il], qwen4_payload_kv_bytes(count));
+            QWEN4_CLONE(layer_ik_cache[il], qwen4_payload_ik_bytes(count));
+            QWEN4_CLONE(layer_block_key[il], qwen4_payload_block_key_bytes(count));
+        }
+    }
+    QWEN4_CLONE(ple_hist, qwen4_payload_ple_hist_bytes());
+    QWEN4_CLONE(pos3, (uint64_t)rows * 16u);
+#undef QWEN4_CLONE
+    const bool copied = ds4_gpu_end_commands() != 0;
+    const bool synchronized = ds4_gpu_synchronize() != 0;
+    if (!ok || !copied || !synchronized) {
+        ds4_session_invalidate(destination);
+        payload_set_err(err, errlen, "cached-summary device state copy failed"); return 1;
+    }
+    memcpy(destination->logits, source->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    ds4_tokens_copy(&destination->checkpoint, &source->checkpoint);
+    memcpy(dst->ple_prev, src->ple_prev, sizeof(dst->ple_prev));
+    dst->mrope_delta = src->mrope_delta; dst->pos = rows; dst->mtp_pos = mtp_rows;
+    dst->mtp_last_rows = 0;
+    dst->snap_valid = dst->snap2_valid = dst->snap0_valid = dst->anchor_valid = false;
+    destination->history_approximate = source->history_approximate;
+    destination->qwen4_rewound = false; destination->mtp_draft_valid = false;
+    destination->checkpoint_valid = true;
+    return 0;
+#else
+    (void)destination; (void)source;
+    payload_set_err(err, errlen, "cached-summary device copying requires Qwen Metal"); return 1;
 #endif
 }
 

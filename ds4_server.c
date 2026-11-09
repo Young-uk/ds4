@@ -40,6 +40,9 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
@@ -814,6 +817,9 @@ typedef struct {
     bool model_from_request;
     /* App-owned background summaries never replace the foreground checkpoint. */
     bool atomic_summary;
+    bool atomic_summary_recovery;
+    char *atomic_cache_owner;
+    char *atomic_summary_clone;
     /* Opt-in foreground reserve; legacy OpenAI clients keep their old boundary. */
     int atomic_output_reserve;
     uint64_t history_summary_hash;
@@ -1028,6 +1034,8 @@ static void request_free(request *r) {
     free(r->images);
     free(r->image_markers);
     free(r->model);
+    free(r->atomic_cache_owner);
+    free(r->atomic_summary_clone);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
     free(r->raw_body);
@@ -4457,6 +4465,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
         } else if (!strcmp(key, "atomic_output_reserve")) {
             if (!json_int(&p, &r->atomic_output_reserve) || r->atomic_output_reserve < 0 || r->atomic_output_reserve > 65536) { free(key); goto bad; }
+        } else if (!strcmp(key, "atomic_cache_owner")) {
+            if (!json_string_replace(&p, &r->atomic_cache_owner) || !r->atomic_cache_owner[0] || strlen(r->atomic_cache_owner) > 512) { free(key); goto bad; }
+        } else if (!strcmp(key, "atomic_summary_clone")) {
+            if (!json_string_replace(&p, &r->atomic_summary_clone) || !r->atomic_summary_clone[0] || strlen(r->atomic_summary_clone) > 512) { free(key); goto bad; }
+        } else if (!strcmp(key, "atomic_summary_recovery")) {
+            if (!json_bool(&p, &r->atomic_summary_recovery)) { free(key); goto bad; }
         } else if (!strcmp(key, "atomic_summary")) {
             if (!json_bool(&p, &r->atomic_summary)) { free(key); goto bad; }
         } else if (!strcmp(key, "model")) {
@@ -4572,6 +4586,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    if (r->atomic_summary_recovery && !r->atomic_summary) goto bad;
+    if (r->atomic_summary_clone && (!r->atomic_summary || r->max_tokens <= 0 || r->max_tokens > 2048 || r->ignore_eos)) goto bad;
     /* Detect a real historical handoff change, not an ordinary cache miss. */
     for (int i = 0; i < msgs.len; i++) {
         if (!qwen_historical_summary(&msgs.v[i])) continue;
@@ -10349,6 +10365,13 @@ struct server_slot {
     int continued_last_store_tokens;
     bool history_request_seen;
     uint64_t history_summary_hash;
+    /* inference_mu owns this exact completed text frontier and UI attestation. */
+    char *atomic_cache_owner;
+    char atomic_history_hash[65];
+    int atomic_cache_tokens;
+    uint64_t atomic_cache_hash;
+    int atomic_cache_tail;
+    uint64_t atomic_cache_epoch;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
     time_t last_used;
@@ -10488,6 +10511,9 @@ struct server {
     int ctx_size;
     bool batched_mode;
     bool dedicated_summary_slot;
+    bool atomic_clone_enabled;
+    char atomic_runtime_id[40];
+    char atomic_model_fingerprint[41];
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
@@ -10564,6 +10590,9 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+static void atomic_cache_persist(server *s, server_slot *slot,
+                                  const ds4_tokens *tokens, const char *text_override);
 
 static bool job_cancelled(void *ud) {
     job *j = ud;
@@ -11656,7 +11685,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const char *cache_text_key,
                                             const char *restore_prompt) {
     if (!s || !slot) return false;
-    if (ds4_session_history_approximate(slot->session)) return false;
+    /* Approximate Qwen payloads carry their explicit v3 marker; ordinary
+     * payload bytes and other backend policies remain unchanged. */
     /* Summaries are disposable computation, not conversation checkpoints. */
     if (s->dedicated_summary_slot && slot->id == s->slot_count - 1) return false;
     char err[160] = {0};
@@ -11699,6 +11729,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     }
     s->kv.protected_anchor_path = fixed_path;
     s->kv.protected_restore_path = protected_path;
+    hooks.require_current_payload = s->atomic_clone_enabled && slot->id == 0 &&
+        slot->atomic_cache_owner && slot->atomic_history_hash[0] && tokens->len == slot->atomic_cache_tokens;
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
                                                   tokens, store_len, reason,
@@ -11706,6 +11738,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
+    if (ok && store_len == tokens->len) atomic_cache_persist(s, slot, tokens, cache_text_override);
     s->kv.protected_restore_path = NULL;
     s->kv.protected_anchor_path = NULL;
     free(fixed_path);
@@ -13345,6 +13378,8 @@ static int server_next_priority_slot_locked(const server *s) {
     const int summary = s->slot_count - 1;
     const bool foreground_ready = s->slots[0].prefill_waiting || s->slots[0].decode_pending;
     const bool summary_ready = s->slots[summary].prefill_waiting || s->slots[summary].decode_pending;
+    const job *urgent = s->slots[summary].running;
+    if (summary_ready && urgent && urgent->req.atomic_summary && urgent->req.atomic_summary_recovery) return summary;
     if (foreground_ready && (!summary_ready || s->foreground_quanta < ATOMIC_FOREGROUND_WEIGHT))
         return 0;
     if (summary_ready) return summary;
@@ -13375,10 +13410,13 @@ static int server_next_prefill_slot_locked(const server *s) {
 
 /* The summary owns a small KV cache, never another full conversation cache. */
 #define ATOMIC_SUMMARY_CONTEXT 16384
+#define ATOMIC_CLONE_HEADROOM 8192
+#define ATOMIC_CLONE_MAX_BYTES (UINT64_C(4) * 1024 * 1024 * 1024)
 
 static int request_context_limit(const server *s, const request *r) {
     return s->dedicated_summary_slot && r->atomic_summary
-        ? ATOMIC_SUMMARY_CONTEXT : s->ctx_size;
+        ? (s->atomic_clone_enabled && r->atomic_summary_clone ? s->ctx_size + ATOMIC_CLONE_HEADROOM
+                                                            : ATOMIC_SUMMARY_CONTEXT) : s->ctx_size;
 }
 
 /* Summary decoding is greedy: verify each MTP draft with the base model.
@@ -13452,7 +13490,14 @@ static int server_prefill_quantum_for(const server *s,
 static int server_prefill_quantum(server *s, const server_slot *slot) {
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
+    const bool recovery = s->dedicated_summary_slot && slot->id == s->slot_count - 1 &&
+        slot->running && slot->running->req.atomic_summary && slot->running->req.atomic_summary_recovery;
+    const bool clone = s->atomic_clone_enabled && slot->id == s->slot_count - 1 &&
+        slot->running && slot->running->req.atomic_summary_clone;
+    const bool foreground_waiting = s->slots[0].prefill_waiting || s->slots[0].decode_pending;
     pthread_mutex_unlock(&s->model_mu);
+    if (recovery) return 2048;
+    if (clone) return foreground_waiting ? 1 : 2048;
     int quantum = server_prefill_quantum_for(s, generation_active);
     /* Always bound the summary, even if chat arrives after this calculation. */
     if (s->dedicated_summary_slot && slot->id == s->slot_count - 1 &&
@@ -14701,6 +14746,8 @@ static int kv_cache_try_load_history(server *s, server_slot *slot, request *req,
     return loaded;
 }
 
+#include "ds4_atomic_summary.h"
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -14717,6 +14764,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
     const bool multimodal = j->req.image_count != 0;
+    if (j->req.atomic_summary_clone && !atomic_clone_prepare(s, slot, j, err, sizeof(err))) {
+        http_error(j->fd, s->enable_cors, 409, err);
+        return;
+    }
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
@@ -16216,6 +16267,9 @@ resume_empty_reply:
         thinking_live_clear(s, slot);
     }
 
+    /* Publish before the final SSE event: the app may immediately attest or
+     * clone this owner once it receives completion. Failed writes revoke it. */
+    atomic_cache_complete(s, slot, j, final_finish, stop_token, client_stop, parsed_calls.len);
     bool response_ok = !job_cancelled(j);
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
@@ -16359,9 +16413,19 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
 
+    if (!j->req.atomic_summary) {
+        pthread_mutex_lock(&s->inference_mu);
+        atomic_cache_clear(slot);
+        pthread_mutex_unlock(&s->inference_mu);
+    }
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    if (!j->req.atomic_summary && job_cancelled(j)) {
+        pthread_mutex_lock(&s->inference_mu);
+        atomic_cache_clear(slot);
+        pthread_mutex_unlock(&s->inference_mu);
+    }
     if (!j->req.atomic_summary && j->req.api == API_OPENAI) {
         slot->history_request_seen = ds4_session_checkpoint_valid(slot->session);
         slot->history_summary_hash = j->req.history_summary_hash;
@@ -16613,6 +16677,8 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    bool atomic_native_source;
+    bool json_content_type;
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -16647,6 +16713,29 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+/* Cached-summary ownership metadata is native-client-only. JSON prevents
+ * simple cross-site POSTs; rejecting Origin keeps browser CORS settings from
+ * turning a local attestation into a cross-origin capability. */
+static void atomic_http_headers(http_request *r, const char *headers, size_t length) {
+    r->atomic_native_source = true; r->json_content_type = false;
+    const char *p = headers, *end = headers + length;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t n = (size_t)(p - line);
+        if (n >= 7 && !strncasecmp(line, "Origin:", 7)) r->atomic_native_source = false;
+        if (n >= 13 && !strncasecmp(line, "Content-Type:", 13)) {
+            const char *value = line + 13;
+            while (value < p && isspace((unsigned char)*value)) value++;
+            size_t left = (size_t)(p - value);
+            if (left >= 16 && !strncasecmp(value, "application/json", 16) &&
+                (left == 16 || value[16] == ';' || isspace((unsigned char)value[16])))
+                r->json_content_type = true;
+        }
+        if (p < end) p++;
+    }
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -16674,6 +16763,7 @@ static bool read_http_request(int fd, http_request *r) {
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
 
+    atomic_http_headers(r, b.ptr, (size_t)hend);
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
@@ -16756,8 +16846,15 @@ static bool send_model(server *s, int fd, const char *id) {
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    buf_printf(&b, "{\"object\":\"list\",\"atomic_summary_slot\":%s,\"atomic_completion_review\":true,\"atomic_tool_preamble\":4,\"atomic_summary_context\":16384,\"atomic_summary_token_count\":true,\"data\":[",
+    buf_printf(&b, "{\"object\":\"list\",\"atomic_summary_slot\":%s,\"atomic_completion_review\":true,\"atomic_tool_preamble\":4,\"atomic_summary_context\":16384,\"atomic_summary_token_count\":true,",
                s->dedicated_summary_slot && s->slot_count > 1 ? "true" : "false");
+    if (s->atomic_clone_enabled) {
+        buf_puts(&b, "\"atomic_summary_clone\":true,\"atomic_summary_stream_progress\":true,\"runtime_id\":");
+        json_escape(&b, s->atomic_runtime_id);
+        buf_puts(&b, ",\"atomic_model_fingerprint\":"); json_escape(&b, s->atomic_model_fingerprint);
+        buf_putc(&b, ',');
+    }
+    buf_puts(&b, "\"data\":[");
     if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
@@ -16910,6 +17007,17 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    const bool atomic_metadata = !strcmp(hr.path, "/v1/status") ||
+        !strcmp(hr.path, "/v1/atomic/history-plan") || !strcmp(hr.path, "/v1/atomic/cache-receipt");
+    if (atomic_metadata && (!hr.atomic_native_source ||
+        (!strcmp(hr.method, "POST") && !hr.json_content_type))) {
+        http_error(fd, s->enable_cors, 403, "cached summary metadata requires a native JSON client");
+        http_request_free(&hr); goto done;
+    }
+    if (atomic_summary_route(s, fd, hr.method, hr.path, hr.body)) {
+        http_request_free(&hr);
+        goto done;
+    }
     if (atomic_stream_route(s, fd, &hr)) {
         http_request_free(&hr);
         goto done;
@@ -17169,6 +17277,7 @@ static void server_close_resources(server *s) {
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
         free(slot->anchor_text);
+        free(slot->atomic_cache_owner);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -17600,6 +17709,10 @@ int main(int argc, char **argv) {
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.dedicated_summary_slot = cfg.dedicated_summary_slot;
+    s.atomic_clone_enabled = cfg.dedicated_summary_slot && slot_count == 2 && cfg.engine.backend == DS4_BACKEND_METAL &&
+        ds4_engine_is_qwen4(engine) && !s.tp_leader && cfg.ctx_size <= INT_MAX - ATOMIC_CLONE_HEADROOM;
+    responses_random_id(s.atomic_runtime_id, sizeof(s.atomic_runtime_id), "dstar_");
+    atomic_model_identity(&s, cfg.engine.model_path);
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.qwen4_summary_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
@@ -17636,13 +17749,17 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
 
-    for (int i = 0; i < slot_count; i++) {
+    /* Create the larger summary bank first so both sessions borrow one
+     * sufficiently wide scratch arena. Server lane IDs and logical foreground
+     * context remain unchanged; mutable state still owns distinct pool views. */
+    for (int order = 0; order < slot_count; order++) {
+        const int i = s.atomic_clone_enabled ? slot_count - 1 - order : order;
         server_slot *slot = &s.slots[i];
         slot->srv = &s;
         slot->id = i;
         if (ds4_session_create(&slot->session, engine,
                 cfg.dedicated_summary_slot && i == s.slot_count - 1
-                    ? ATOMIC_SUMMARY_CONTEXT : cfg.ctx_size) != 0) {
+                    ? (s.atomic_clone_enabled ? cfg.ctx_size + ATOMIC_CLONE_HEADROOM : ATOMIC_SUMMARY_CONTEXT) : cfg.ctx_size) != 0) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: failed to create %s session %d/%d",
                        ds4_backend_name(cfg.engine.backend), i + 1, slot_count);
@@ -17930,6 +18047,15 @@ static void test_summary_weighted_prefill_threads(void) {
     TEST_ASSERT(server_prefill_quantum(&s, &slots[0]) == 2048);
     s.active_generations = 1;
     TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == ATOMIC_SUMMARY_PREFILL_QUANTUM);
+    job urgent = {0}; urgent.req.atomic_summary = true; urgent.req.atomic_summary_recovery = true;
+    slots[1].running = &urgent;
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == 2048);
+    slots[0].decode_pending = true; slots[1].prefill_waiting = true;
+    TEST_ASSERT(server_next_priority_slot_locked(&s) == 1);
+    urgent.req.atomic_summary_recovery = false;
+    TEST_ASSERT(server_next_priority_slot_locked(&s) == 0);
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == ATOMIC_SUMMARY_PREFILL_QUANTUM);
+    slots[1].running = NULL; slots[0].decode_pending = false; slots[1].prefill_waiting = false;
     priority_prefill_test tasks[2] = {{&s, &slots[0], 800, 0}, {&s, &slots[1], 100, 0}};
     pthread_t threads[2];
     for (int i = 0; i < 2; i++) TEST_ASSERT(pthread_create(&threads[i], NULL, test_priority_prefill_worker, &tasks[i]) == 0);
@@ -25575,7 +25701,38 @@ static void test_cache_diagnostics_are_metadata_only(void) {
     buf_free(&a); buf_free(&b); buf_free(&c);
 }
 
+static void test_atomic_cached_summary_metadata(void) {
+    char *raw = NULL;
+    TEST_ASSERT(atomic_field("{\"owner\":\"thread/turn\",\"nested\":{\"owner\":1}}", "owner", &raw));
+    TEST_ASSERT(raw && !strcmp(raw, "\"thread/turn\"")); free(raw);
+    TEST_ASSERT(!atomic_field("{\"owner\":1,\"owner\":2}", "owner", &raw));
+    TEST_ASSERT(!atomic_field("{\"owner\":1} true", "owner", &raw));
+    TEST_ASSERT(!atomic_field("{\"owner\":1,}", "owner", &raw));
+    TEST_ASSERT(!atomic_field("{\"owner\":", "owner", &raw));
+    int value = 0;
+    TEST_ASSERT(atomic_integer("{\"boundary\":125}", "boundary", &value) && value == 125);
+    TEST_ASSERT(!atomic_integer("{\"boundary\":1.5}", "boundary", &value));
+    TEST_ASSERT(!atomic_integer("{\"boundary\":true}", "boundary", &value));
+    char *owner = atomic_string("{\"owner\":\"thread/turn\"}", "owner", 512);
+    TEST_ASSERT(owner && !strcmp(owner, "thread/turn")); free(owner);
+    TEST_ASSERT(!atomic_string("{\"owner\":null}", "owner", 512));
+    TEST_ASSERT(!atomic_string("{\"owner\":\"long\"}", "owner", 2));
+    TEST_ASSERT(atomic_hex("0123456789abcdef", 16));
+    TEST_ASSERT(!atomic_hex("0123456789abcdeg", 16));
+    http_request request = {0};
+    const char *native = "POST /v1/atomic/cache-receipt HTTP/1.1\r\nContent-Type: application/json\r\n\r\n";
+    atomic_http_headers(&request, native, strlen(native));
+    TEST_ASSERT(request.atomic_native_source && request.json_content_type);
+    const char *foreign = "POST /v1/atomic/cache-receipt HTTP/1.1\r\nOrigin: https://foreign.example\r\nContent-Type: application/json\r\n\r\n";
+    atomic_http_headers(&request, foreign, strlen(foreign));
+    TEST_ASSERT(!request.atomic_native_source);
+    const char *plain = "POST /v1/atomic/cache-receipt HTTP/1.1\r\nContent-Type: text/plain\r\n\r\n";
+    atomic_http_headers(&request, plain, strlen(plain));
+    TEST_ASSERT(request.atomic_native_source && !request.json_content_type);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_atomic_cached_summary_metadata();
     TEST_ASSERT(!strcmp(diagnostic_tail_class("abc", 3, "abcdef", 6, true), "same-decoded-prefix"));
     TEST_ASSERT(!strcmp(diagnostic_tail_region("<|im_start|>assistant\n<think>secret</think>answer", strlen("<|im_start|>assistant\n<think>secret</think>answer"), 40), "answer"));
     TEST_ASSERT(!strcmp(diagnostic_tail_region("private data", 12, 3), "text"));

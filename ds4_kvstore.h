@@ -95,6 +95,9 @@ typedef struct {
 
 typedef struct {
     void *ud;
+    /* A UI-owner receipt must attest this actual native frontier, not a
+     * previously cached payload sharing only the rendered-text key. */
+    bool require_current_payload;
     uint8_t ext_flag;
     bool (*serialized_size)(void *ud, const char *text, uint64_t *bytes_out);
     bool (*write)(void *ud, FILE *fp, const char *text, uint64_t *written_bytes);

@@ -40,9 +40,23 @@ int main(void) {
     }
     FILE *fp = tmpfile();
     REQUIRE(fp);
-    REQUIRE(ds4_session_save_payload(s, fp, err, sizeof(err)) != 0);
-    REQUIRE(ftell(fp) == 0); /* Never label an approximate cache as exact. */
-    fclose(fp);
+    REQUIRE(ds4_session_save_payload(s, fp, err, sizeof(err)) == 0);
+    uint32_t header[2]; rewind(fp);
+    REQUIRE(fread(header, sizeof(uint32_t), 2, fp) == 2);
+    /* Never label an approximate cache as exact. Version three preserves its
+     * recurrent provenance and absolute positions when cloned or restarted. */
+    REQUIRE(header[0] == DS4_SESSION_PAYLOAD_MAGIC && header[1] == DS4_SESSION_HISTORY_PAYLOAD_VERSION);
+    rewind(fp);
+    ds4_session *restored = NULL;
+    REQUIRE(ds4_session_create(&restored, e, 16384) == 0);
+    REQUIRE(ds4_session_load_payload(restored, fp, ds4_session_payload_bytes(s), err, sizeof(err)) == 0);
+    REQUIRE(ds4_session_history_approximate(restored));
+    REQUIRE(ds4_session_clone_state(restored, s, err, sizeof(err)) == 0);
+    REQUIRE(ds4_session_history_approximate(restored));
+    const ds4_tokens *original_tokens = ds4_session_tokens(s), *restored_tokens = ds4_session_tokens(restored);
+    REQUIRE(original_tokens->len == restored_tokens->len);
+    REQUIRE(!memcmp(original_tokens->v, restored_tokens->v, (size_t)original_tokens->len * sizeof(int)));
+    ds4_session_free(restored); fclose(fp);
     ds4_tokens extra = {0}, follow = {0};
     ds4_tokenize_text(e, " The current marker is", &extra);
     REQUIRE(extra.len > 0);

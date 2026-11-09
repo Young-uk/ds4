@@ -103,15 +103,21 @@ ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OB
 
 # Model-free scheduler qualification; deliberately separate from model tests.
 .PHONY: test-summary-scheduler
-test-summary-scheduler: ds4_server_test tests/test_summary_scheduler_fake
+test-summary-scheduler: ds4_server_test tests/test_summary_scheduler_fake tests/test_cached_summary_fake tests/test_history_payload
 	./ds4_server_test
 	./tests/test_summary_scheduler_fake
+	./tests/test_cached_summary_fake
+	./tests/test_history_payload
 
-ds4_server_test: ds4_server.c $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
+ds4_server_test: ds4_server.c ds4_atomic_summary.h $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_SERVER_TEST -o $@ ds4_server.c ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-tests/test_summary_scheduler_fake: tests/test_summary_scheduler_fake.c ds4_server.c $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
+tests/test_summary_scheduler_fake: tests/test_summary_scheduler_fake.c ds4_server.c ds4_atomic_summary.h $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
 	$(CC) $(CFLAGS) -Wno-unused-function -o $@ tests/test_summary_scheduler_fake.c ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+tests/test_cached_summary_fake: tests/test_cached_summary_fake.c ds4_server.c ds4_atomic_summary.h $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
+	$(CC) $(CFLAGS) -Wno-unused-function -o $@ tests/test_cached_summary_fake.c ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+
 
 ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -520,7 +526,7 @@ test-qwen4-cuda: tests/test_qwen4_cuda
 	./tests/test_qwen4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_linux_memory.h ds4_engram.h
+ds4.o: ds4.c ds4.h ds4_history_payload.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_linux_memory.h ds4_engram.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -553,7 +559,7 @@ ds4_prompt_prefix.o: ds4_prompt_prefix.c ds4_prompt_prefix.h ds4.h
 ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_gpu_args.c
 
-ds4_server.o: ds4_server.c ds4_resumable.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+ds4_server.o: ds4_server.c ds4_atomic_summary.h ds4_resumable.h ds4_atomic_summary.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
@@ -574,7 +580,7 @@ ds4_web.o: ds4_web.c ds4_web.h
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4_resumable.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+ds4_test.o: tests/ds4_test.c ds4_server.c ds4_resumable.h ds4_atomic_summary.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h linenoise.h
@@ -589,7 +595,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h
+ds4_cpu.o: ds4.c ds4.h ds4_history_payload.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h linenoise.h
@@ -598,7 +604,7 @@ ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt
 ds4_gpu_args_cpu.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_gpu_args.c
 
-ds4_server_cpu.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+ds4_server_cpu.o: ds4_server.c ds4_atomic_summary.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
 ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
@@ -1151,3 +1157,8 @@ clean:
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+
+# Model-independent validation of exact/approximate payload format gates.
+tests/test_history_payload: tests/test_history_payload.c ds4_history_payload.h ds4.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_history_payload.c

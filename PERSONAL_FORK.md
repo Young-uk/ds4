@@ -211,3 +211,49 @@ Metal device memory peak. Test configurations must use isolated caches.
 Model-free launcher coverage is part of `make test-frontends`. It checks both
 model routes, the unchanged defaults, positive bounds, malformed values, and
 raw server argument forwarding without downloading or loading a model.
+
+
+## Owner-bound conversation-cache summaries (2026-11-09)
+
+On local Qwen Metal with the dedicated summary slot, the server now explicitly
+advertises cached-summary cloning, a per-process identity and a model/native
+binary/config fingerprint. The app uses the same cloned-history summary adapter
+as Strata, including source anchors, the 60% tokenizer trigger, prompt-pressure
+recovery, a 2048-token JSON output bound, unfinished-work ledger, request-local
+input progress and latest-cache handoff revalidation. Legacy summary requests
+keep their 16K limit and ordinary clients retain their previous behavior.
+
+A completed text request binds its actual token frontier to an app owner. Clone
+admission validates that owner and copies mutable state into the independent
+summary session once, sharing the model weights. Canonical assistant termination
+and a newline precede the new task; a thinking-control stop is never replayed
+as a new think opener. The larger summary session is created first so both lanes share one scratch
+arena. It has the main context plus 8192 tokens of task/output headroom. Live
+cloning uses device blits rather than a second full-size host payload. Device-state copies are bounded to 4 GiB and available context;
+failed copies and cancellation never invalidate or replace the foreground state.
+The existing weighted 8:1 executor schedules subsequent work, with ordinary 2048
+idle prefill chunks and one token when foreground compute waits. No locks added.
+
+The retained-history matcher already accepts arbitrary token intervals and
+rebuilds indexer blocks, so no four-token alignment restriction is introduced.
+The tokenizer-only planner snapshots the current owner/epoch, uses the actual
+Dstar request renderer and rejects a changed frontier. The app may keep earlier
+raw overlap without changing the immutable summary evidence or request ledger.
+
+Approximate Qwen state uses explicit payload version 3; ordinary version 2
+remains byte-identical. Absolute text positions, mrope delta and the approximate
+flag survive snapshots and disk restore. Version 3 validates bounded monotonic
+text positions and is rejected outside local non-TP Qwen Metal. Full app-bound
+cache saves publish the actual native payload plus a small private receipt;
+partial prefix checkpoints never acquire ownership. A verified receipt can
+restore the summary bank at startup without touching the foreground session.
+Missing, changed or incompatible receipts leave ordinary disk reuse available.
+
+Model-free checks cover separate mutable frontiers, cancellation/failure/source
+rejection, native JSON metadata guards, verified receipt restart, file changes,
+legacy payload acceptance, v3 format gates, text position bounds, weighted
+scheduling, launcher and browser recovery regressions. CPU compilation is checked.
+The live retained-history test now includes an explicit v3 round trip into a
+larger session, but it is left for the user's manual run. No real model inference,
+Metal/SSD throughput, long-context peak memory, CUDA hardware or distributed
+inference benchmark is claimed by this port.

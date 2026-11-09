@@ -1010,7 +1010,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
-    if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
+    /* Equal rendered text does not authenticate equal approximate recurrent
+     * state. Publish this actual frontier before binding its restart receipt. */
+    if (!(hooks && hooks->require_current_payload) && !ds4_session_history_approximate(session) &&
+        kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);

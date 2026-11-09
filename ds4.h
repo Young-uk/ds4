@@ -647,6 +647,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
 #define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
+#define DS4_SESSION_HISTORY_PAYLOAD_VERSION UINT32_C(3)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
@@ -660,6 +661,9 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+/* Copy text-only local Qwen Metal state between independent sessions of the
+ * same engine. Caller serializes compute; evaluate fresh input before sampling. */
+int ds4_session_clone_state(ds4_session *destination, ds4_session *source, char *err, size_t errlen);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
