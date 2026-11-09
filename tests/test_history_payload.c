@@ -3,6 +3,12 @@
 #include <assert.h>
 #include <stdio.h>
 int main(void) {
+    assert(ds4_history_image_discarded(100, 200, 64, 768, 1536));
+    assert(ds4_history_image_discarded(1600, 100, 64, 768, 1536));
+    assert(!ds4_history_image_discarded(60, 20, 64, 768, 1536));
+    assert(!ds4_history_image_discarded(760, 20, 64, 768, 1536));
+    assert(!ds4_history_image_discarded(800, 20, 64, 768, 1536));
+    assert(!ds4_history_image_discarded(UINT64_MAX, 20, 64, 768, 1536));
     for (int qwen = 0; qwen < 2; qwen++) for (int tp = 0; tp < 2; tp++) {
         assert(ds4_history_payload_version_valid(2, qwen, tp));
         assert(ds4_history_payload_version_valid(3, qwen, tp) == (qwen && !tp));

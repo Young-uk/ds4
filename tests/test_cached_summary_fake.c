@@ -22,6 +22,7 @@
 typedef struct { int values[2048]; int count, capacity, hidden, valid, vision; } fake_state;
 static ds4_tokens view;
 static int save_calls, load_calls, fail_load;
+static uint64_t reported_bytes;
 static job *cancel_on_load;
 int fake_eos(ds4_engine *engine) { (void)engine; return 248046; }
 void fake_tokenize(ds4_engine *engine, const char *text, ds4_tokens *tokens) {
@@ -37,7 +38,7 @@ int fake_pos(ds4_session *s) { return ((const fake_state *)s)->count; }
 int fake_ctx(ds4_session *s) { return ((const fake_state *)s)->capacity; }
 bool fake_valid(const ds4_session *s) { return ((const fake_state *)s)->valid; }
 bool fake_vision(const ds4_session *s) { return ((const fake_state *)s)->vision; }
-uint64_t fake_bytes(ds4_session *s) { (void)s; return sizeof(fake_state); }
+uint64_t fake_bytes(ds4_session *s) { (void)s; return reported_bytes ? reported_bytes : sizeof(fake_state); }
 int fake_model(ds4_engine *e) { (void)e; return 0; }
 int fake_quant(ds4_engine *e) { (void)e; return 4; }
 void fake_invalidate(ds4_session *s) { fake_state *state = (fake_state *)s; state->valid = 0; state->count = 0; }
@@ -87,7 +88,7 @@ static void setup(server *s, server_slot slots[2], fake_state states[2], job *j)
     j->req.atomic_summary_clone = xstrdup("thread/u0"); j->req.think_mode = DS4_THINK_NONE; j->req.max_tokens = 2048;
     ds4_tokens_push(&j->req.prompt, 300); ds4_tokens_push(&j->req.prompt, 301);
     slots[1].running = j;
-    save_calls = load_calls = fail_load = 0; cancel_on_load = NULL;
+    save_calls = load_calls = fail_load = 0; reported_bytes = 0; cancel_on_load = NULL;
 }
 static void cleanup(server *s, job *j) {
     for (int i = 0; i < 2; i++) { free(s->slots[i].atomic_cache_owner); free(s->slots[i].live_text); free(s->slots[i].anchor_text); }
@@ -108,12 +109,21 @@ static void test_independent_frontiers(void) {
     TEST_ASSERT(states[0].hidden == 988 && states[1].hidden == 989);
     cleanup(&s, &j);
 }
+static void test_processed_image_clone(void) {
+    server s; server_slot slots[2]; fake_state states[2]; job j; setup(&s, slots, states, &j);
+    states[0].vision = 1;
+    fake_state original = states[0]; char err[160] = "";
+    TEST_ASSERT(atomic_clone_prepare(&s, &slots[1], &j, err, sizeof(err)));
+    TEST_ASSERT(states[1].hidden == original.hidden && j.req.prompt.len > original.count);
+    TEST_ASSERT(!memcmp(&original, &states[0], sizeof(original)));
+    cleanup(&s, &j);
+}
 static void test_rejected_or_cancelled_copy(void) {
     for (int mode = 0; mode < 6; mode++) {
         server s; server_slot slots[2]; fake_state states[2]; job j; setup(&s, slots, states, &j);
         fake_state before = states[0]; char err[160] = "";
         if (mode == 0) { free(j.req.atomic_summary_clone); j.req.atomic_summary_clone = xstrdup("other/turn"); }
-        if (mode == 1) states[0].vision = 1;
+        if (mode == 1) slots[0].atomic_cache_hash++;
         if (mode == 2) states[1].capacity = 1025;
         if (mode == 3) fail_load = 1;
         if (mode == 4) job_mark_cancelled(&j);
@@ -125,14 +135,15 @@ static void test_rejected_or_cancelled_copy(void) {
         cleanup(&s, &j);
     }
 }
-static void test_disk_receipt_restart(void) {
+static void test_disk_receipt_restart(bool vision) {
     server s; server_slot slots[2]; fake_state states[2]; job j; setup(&s, slots, states, &j);
+    states[0].vision = vision;
     char directory[] = "/tmp/dstar-clone-test.XXXXXX"; TEST_ASSERT(mkdtemp(directory) != NULL);
     s.kv.enabled = true; s.kv.dir = directory;
     const char *text = "canonical checkpoint"; char sha[41]; ds4_kvstore_sha1_bytes_hex(text, strlen(text), sha);
     char *path = ds4_kvstore_path_for_sha(&s.kv, sha); FILE *fp = fopen(path, "wb"); TEST_ASSERT(fp);
     uint8_t cache_header[DS4_KVSTORE_FIXED_HEADER];
-    ds4_kvstore_fill_header(cache_header, 0, 4, DS4_KVSTORE_REASON_SHUTDOWN, 0, 1024, 0, 8192, 1, 1, sizeof(fake_state));
+    ds4_kvstore_fill_header(cache_header, 0, 4, DS4_KVSTORE_REASON_SHUTDOWN, vision ? DS4_KVSTORE_EXT_VISION : 0, 1024, 0, 8192, 1, 1, sizeof(fake_state));
     fwrite(cache_header, 1, sizeof(cache_header), fp);
     uint8_t n[4]; ds4_kvstore_le_put32(n, (uint32_t)strlen(text));
     fwrite(n, 1, 4, fp); fwrite(text, 1, strlen(text), fp); fwrite(&states[0], 1, sizeof(states[0]), fp); fclose(fp);
@@ -152,8 +163,18 @@ static void test_disk_receipt_restart(void) {
     char *binding = atomic_receipt_path(&s); unlink(binding); free(binding); unlink(path); free(path); rmdir(directory);
     cleanup(&s, &j);
 }
+static void test_large_clone_uses_destination_capacity_not_a_four_gib_ceiling(void) {
+    server s; server_slot slots[2]; fake_state states[2]; job j; setup(&s, slots, states, &j);
+    reported_bytes = UINT64_C(5) * 1024 * 1024 * 1024;
+    char err[160] = "";
+    TEST_ASSERT(atomic_clone_prepare(&s, &slots[1], &j, err, sizeof(err)));
+    TEST_ASSERT(save_calls == 1 && load_calls == 1);
+    cleanup(&s, &j);
+}
 int main(void) {
-    test_independent_frontiers(); test_rejected_or_cancelled_copy(); test_disk_receipt_restart();
+    test_processed_image_clone();
+    test_large_clone_uses_destination_capacity_not_a_four_gib_ceiling();
+    test_independent_frontiers(); test_rejected_or_cancelled_copy(); test_disk_receipt_restart(false); test_disk_receipt_restart(true);
     if (test_failures) return 1;
     puts("cached summary fake backend: independent frontiers, six rejection paths and verified disk restart passed"); return 0;
 }

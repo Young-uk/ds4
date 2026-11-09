@@ -661,7 +661,7 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
-/* Copy text-only local Qwen Metal state between independent sessions of the
+/* Copy completed local Qwen Metal state between independent sessions of the
  * same engine. Caller serializes compute; evaluate fresh input before sampling. */
 int ds4_session_clone_state(ds4_session *destination, ds4_session *source, char *err, size_t errlen);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);

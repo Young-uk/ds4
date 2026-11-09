@@ -64528,7 +64528,7 @@ int ds4_session_clone_state(ds4_session *destination, ds4_session *source, char 
         !source->engine || source->engine->backend != DS4_BACKEND_METAL ||
         !ds4_session_is_qwen4(source) || source->distributed || destination->distributed ||
         source->engine->tp.active || !source->checkpoint_valid || source->checkpoint.len <= 0 ||
-        source->checkpoint_image_count || source->sync_image_count || source->qwen4_rewound ||
+        source->qwen4_rewound ||
         !source->qwen4_graph_ready || !destination->qwen4_graph_ready ||
         source->qwen4_graph.pos != (uint32_t)source->checkpoint.len ||
         source->checkpoint.len >= destination->ctx_size) {
@@ -64574,6 +64574,8 @@ int ds4_session_clone_state(ds4_session *destination, ds4_session *source, char 
     memcpy(destination->logits, source->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     ds4_tokens_copy(&destination->checkpoint, &source->checkpoint);
     memcpy(dst->ple_prev, src->ple_prev, sizeof(dst->ple_prev));
+    /* Image embeddings are already folded into these tensors. The clone is
+     * a one-shot text continuation: preserve positions/delta, not image owners. */
     dst->mrope_delta = src->mrope_delta; dst->pos = rows; dst->mtp_pos = mtp_rows;
     dst->mtp_last_rows = 0;
     dst->snap_valid = dst->snap2_valid = dst->snap0_valid = dst->anchor_valid = false;
@@ -85984,9 +85986,17 @@ static bool history_move_rows(ds4_gpu_tensor *t, int dst, int src, int rows,
 
 bool ds4_session_history_compact(ds4_session *s, int first, int end, int keep_end) {
     if (!s || s->engine->backend != DS4_BACKEND_METAL || !ds4_session_is_qwen4(s) || !s->checkpoint_valid ||
-        s->checkpoint_image_count || s->sync_image_count || s->distributed ||
+        s->distributed ||
         ds4_session_tp_leader(s) || first < 0 || end <= first ||
         end >= keep_end || keep_end > s->checkpoint.len) return false;
+    // Image identities may be forgotten only when the new text history drops
+    // every image span. Processed visual effects remain in retained tensors.
+    for (size_t i = 0; i < s->checkpoint_image_count; i++)
+        if (!ds4_history_image_discarded(s->checkpoint_images[i].token_start,
+                s->checkpoint_images[i].token_count, first, end, keep_end)) return false;
+    for (size_t i = 0; i < s->sync_image_count; i++)
+        if (!ds4_history_image_discarded(s->sync_images[i].token_start,
+                s->sync_images[i].embedding.token_count, first, end, keep_end)) return false;
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     if (!s->qwen4_graph_ready || g->pos != (uint32_t)s->checkpoint.len) return false;
     const int n = s->checkpoint.len, tail = keep_end - end, removed = n - first - tail;
@@ -86015,6 +86025,8 @@ bool ds4_session_history_compact(ds4_session *s, int first, int end, int keep_en
     if (!ok || !ds4_gpu_synchronize()) { ds4_session_invalidate(s); return false; }
     memmove(s->checkpoint.v + first, s->checkpoint.v + end, (size_t)tail * sizeof(int));
     s->checkpoint.len = first + tail;
+    free(s->checkpoint_images); s->checkpoint_images = NULL; s->checkpoint_image_count = 0;
+    s->sync_images = NULL; s->sync_image_count = 0;
     g->pos -= removed;
     g->mrope_delta += removed; /* future tokens follow the old absolute frontier */
     g->snap_valid = g->snap2_valid = g->snap0_valid = g->anchor_valid = false;

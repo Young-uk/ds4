@@ -13414,7 +13414,6 @@ static int server_next_prefill_slot_locked(const server *s) {
 /* The summary owns a small KV cache, never another full conversation cache. */
 #define ATOMIC_SUMMARY_CONTEXT 16384
 #define ATOMIC_CLONE_HEADROOM 8192
-#define ATOMIC_CLONE_MAX_BYTES (UINT64_C(4) * 1024 * 1024 * 1024)
 
 static int request_context_limit(const server *s, const request *r) {
     return s->dedicated_summary_slot && r->atomic_summary

@@ -23,4 +23,12 @@ static inline bool ds4_history_positions_valid(const uint32_t *positions, uint32
     }
     return true;
 }
+/* A text handoff may discard an image span, but cannot retain a fragment of
+ * an image or silently relabel retained image rows as text. */
+static inline bool ds4_history_image_discarded(uint64_t start, uint64_t count,
+        uint64_t prefix, uint64_t source, uint64_t keep_end) {
+    return count && start <= UINT64_MAX - count && start >= prefix &&
+        (start + count <= source || start >= keep_end);
+}
+
 #endif

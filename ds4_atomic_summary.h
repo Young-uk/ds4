@@ -79,7 +79,7 @@ static bool atomic_cache_matches(const server_slot *slot, const char *owner) {
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     return owner && slot->atomic_cache_owner && !strcmp(owner, slot->atomic_cache_owner) &&
         tokens && tokens->len > 0 && tokens->len == slot->atomic_cache_tokens &&
-        ds4_session_checkpoint_valid(slot->session) && !ds4_session_has_vision_state(slot->session) &&
+        ds4_session_checkpoint_valid(slot->session) &&
         atomic_tokens_hash(tokens) == slot->atomic_cache_hash;
 }
 
@@ -87,12 +87,11 @@ static void atomic_cache_complete(server *s, server_slot *slot, job *j,
                                   const char *finish, int tail, bool client_stop, int calls) {
     if (!s->atomic_clone_enabled || slot->id != 0 || j->req.atomic_summary ||
         j->req.kind != REQ_CHAT || j->req.api != API_OPENAI || !j->req.atomic_cache_owner ||
-        j->req.image_count || calls || client_stop || strcmp(finish, "stop") || tail < 0 ||
+        calls || client_stop || strcmp(finish, "stop") || tail < 0 ||
         job_cancelled(j)) return;
     pthread_mutex_lock(&s->inference_mu);
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (tokens && tokens->len > 0 && ds4_session_checkpoint_valid(slot->session) &&
-        !ds4_session_has_vision_state(slot->session)) {
+    if (tokens && tokens->len > 0 && ds4_session_checkpoint_valid(slot->session)) {
         atomic_cache_clear(slot);
         slot->atomic_cache_owner = xstrdup(j->req.atomic_cache_owner);
         slot->atomic_cache_tokens = tokens->len;
@@ -199,7 +198,7 @@ static FILE *atomic_receipt_open(server *s, const atomic_receipt *receipt, ds4_k
     if (ok) ok = ds4_kvstore_read_header(fp, header, &bytes) && bytes && bytes <= 16 * 1024 * 1024 &&
         header->tokens == (uint32_t)receipt->tokens && header->ctx_size <= (uint32_t)s->ctx_size &&
         header->model_id == ds4_engine_model_id(s->engine) &&
-        header->quant_bits == ds4_engine_routed_quant_bits(s->engine) && !(header->ext_flags & DS4_KVSTORE_EXT_VISION);
+        header->quant_bits == ds4_engine_routed_quant_bits(s->engine);
     char *text = ok ? xmalloc((size_t)bytes + 1) : NULL;
     if (ok) {
         ok = fread(text, 1, bytes, fp) == bytes;
@@ -267,7 +266,7 @@ static bool atomic_clone_prepare(server *s, server_slot *slot, job *j, char *err
     if (atomic_cache_matches(source, r->atomic_summary_clone)) {
         uint64_t bytes = ds4_session_payload_bytes(source->session);
         const ds4_tokens *tokens = ds4_session_tokens(source->session);
-        if (!bytes || bytes > ATOMIC_CLONE_MAX_BYTES ||
+        if (!bytes ||
             (int64_t)tokens->len + 1 + separator.len + r->prompt.len + r->max_tokens > ds4_session_ctx(slot->session)) {
             snprintf(err, errlen, "cached summary exceeds snapshot or context headroom");
         } else {
@@ -276,7 +275,7 @@ static bool atomic_clone_prepare(server *s, server_slot *slot, job *j, char *err
         }
     } else if (atomic_receipt_read(s, &receipt) && !strcmp(receipt.owner, r->atomic_summary_clone)) {
         ds4_kvstore_entry header = {0}; FILE *fp = atomic_receipt_open(s, &receipt, &header);
-        if (fp && header.payload_bytes <= ATOMIC_CLONE_MAX_BYTES &&
+        if (fp && header.payload_bytes > 0 &&
             (int64_t)receipt.tokens + 1 + separator.len + r->prompt.len + r->max_tokens <= ds4_session_ctx(slot->session)) {
             ok = ds4_session_load_payload(slot->session, fp, header.payload_bytes, err, errlen) == 0;
             const ds4_tokens *tokens = ds4_session_tokens(slot->session);
