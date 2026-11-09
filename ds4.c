@@ -48,6 +48,11 @@
 #include "ds4_image.h"
 #include "ds4_engram.h"
 #include "ds4_tp.h"
+static uint32_t qwen4_image_token_budget(void) {
+    const char *value = getenv("DS4_QWEN4_IMAGE_MAX_TOKENS");
+    const long count = value ? atol(value) : 0;
+    return count >= 64 && count <= 16383 ? (uint32_t)count : 1024u;
+}
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 #define DS4_HAS_DEEPSEEK41_GPU 1
 #endif
@@ -7828,11 +7833,7 @@ static void qwen4_vision_pos_embed(const float *table, uint32_t side, uint32_t n
     }
 }
 
-static uint32_t qwen4_vision_max_tokens(void) {
-    const char *env = getenv("DS4_QWEN4_IMAGE_MAX_TOKENS");
-    const long v = env ? atol(env) : 0;
-    return v >= 64 && v <= 16383 ? (uint32_t)v : 1024u;   /* 4 patches per token, < 65536 patches */
-}
+static uint32_t qwen4_vision_max_tokens(void) { return qwen4_image_token_budget(); }
 
 /* preprocess + encode one image with the bound mmproj; out gets malloc'd
  * [tokens][n_out] embeddings */
@@ -73165,6 +73166,39 @@ int ds4_engine_vision_encode_file(
     ds4_image image = {0};
     if (!ds4_image_decode_file(&image, path, error, error_cap)) return 0;
     int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
+    ds4_image_free(&image);
+    return ok;
+}
+
+int ds4_engine_vision_count_memory(ds4_engine *e, const uint8_t *encoded,
+        size_t encoded_len, uint32_t start_pos, uint32_t *count, char *error, size_t error_cap) {
+    if (!e || !e->vision_ready || !count) {
+        if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
+        return 0;
+    }
+    ds4_image image = {0};
+    if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
+    int ok = 0;
+    if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
+        ds4_deepseek4_image_patches patches = {0};
+        ds4_deepseek4_image_layout layout = {0};
+        ok = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
+            ds4_image_preprocess_deepseek41(&patches, &image, error, error_cap) :
+            ds4_image_preprocess_deepseek4(&patches, &image, error, error_cap);
+        if (ok) ok = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
+            ds4_deepseek41_image_layout_build(&layout, patches.llm_grid_height, patches.llm_grid_width, error, error_cap) :
+            ds4_deepseek4_image_layout_build(&layout, patches.llm_grid_height, patches.llm_grid_width, start_pos, error, error_cap);
+        if (ok) *count = layout.token_count;
+        ds4_deepseek4_image_layout_free(&layout);
+        ds4_deepseek4_image_patches_free(&patches);
+    } else {
+        ds4_image_patches patches = {0};
+        ok = e->vision_kind == DS4_VISION_QWEN4 ?
+            ds4_image_preprocess_qwen4(&patches, &image, 64u, qwen4_image_token_budget(), error, error_cap) :
+            ds4_image_preprocess_glm53(&patches, &image, 16u, 8000u, error, error_cap);
+        if (ok) *count = patches.image_token_count + 2u;
+        ds4_image_patches_free(&patches);
+    }
     ds4_image_free(&image);
     return ok;
 }

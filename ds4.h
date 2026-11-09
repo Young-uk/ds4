@@ -267,6 +267,9 @@ int ds4_engine_vision_encode_file(ds4_engine *e,
                                   ds4_vision_embedding *out,
                                   char *error,
                                   size_t error_cap);
+/* Exact prompt span length from CPU image preprocessing; never runs vision inference. */
+int ds4_engine_vision_count_memory(ds4_engine *e, const uint8_t *encoded,
+        size_t encoded_len, uint32_t start_pos, uint32_t *count, char *error, size_t error_cap);
 int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     const uint8_t *encoded,
                                     size_t encoded_len,

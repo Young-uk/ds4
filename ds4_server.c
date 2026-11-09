@@ -721,6 +721,8 @@ static void server_inference_unlock(server *s);
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen);
+static bool server_count_image(server *s, const server_image_input *input,
+                               uint32_t start, uint32_t *span, char *err, size_t errlen);
 
 typedef struct {
     char *id;
@@ -819,6 +821,7 @@ typedef struct {
     /* App-owned background summaries never replace the foreground checkpoint. */
     bool atomic_summary;
     bool atomic_summary_recovery;
+    bool atomic_background_task;
     char *atomic_cache_owner;
     char *atomic_summary_clone;
     /* Opt-in foreground reserve; legacy OpenAI clients keep their old boundary. */
@@ -4410,8 +4413,8 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
-static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen) {
+static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *body, int def_tokens,
+                               int ctx_size, request *r, char *err, size_t errlen, bool count_only) {
     request_init(r, REQ_CHAT, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
@@ -4470,6 +4473,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             if (!json_string_replace(&p, &r->atomic_cache_owner) || !r->atomic_cache_owner[0] || strlen(r->atomic_cache_owner) > 512) { free(key); goto bad; }
         } else if (!strcmp(key, "atomic_summary_clone")) {
             if (!json_string_replace(&p, &r->atomic_summary_clone) || !r->atomic_summary_clone[0] || strlen(r->atomic_summary_clone) > 512) { free(key); goto bad; }
+        } else if (!strcmp(key, "atomic_background_task")) {
+            if (!json_bool(&p, &r->atomic_background_task)) { free(key); goto bad; }
         } else if (!strcmp(key, "atomic_summary_recovery")) {
             if (!json_bool(&p, &r->atomic_summary_recovery)) { free(key); goto bad; }
         } else if (!strcmp(key, "atomic_summary")) {
@@ -4588,6 +4593,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         return false;
     }
     if (r->atomic_summary_recovery && !r->atomic_summary) goto bad;
+    if (r->atomic_background_task && !r->atomic_summary) goto bad;
     if (r->atomic_summary_clone && (!r->atomic_summary || r->max_tokens <= 0 || r->max_tokens > 2048 || r->ignore_eos)) goto bad;
     /* Detect a real historical handoff change, not an ordinary cache miss. */
     for (int i = 0; i < msgs.len; i++) {
@@ -4617,7 +4623,46 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
+    bool counted = false, count_ok = true;
+    if (count_only) {
+        size_t count = 0;
+        for (int i = 0; i < msgs.len; i++) count += msgs.v[i].images.len;
+        if (count) {
+            if (r->atomic_summary) {
+                snprintf(err, errlen, "summary token counting requires text-only messages");
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                request_free(r);
+                return false;
+            }
+            counted = true;
+            const size_t drop = server_images_to_drop(count);
+            server_image_input **all = xmalloc(count * sizeof(*all));
+            size_t k = 0;
+            for (int i = 0; i < msgs.len; i++) for (size_t j = 0; j < msgs.v[i].images.len; j++) all[k++] = &msgs.v[i].images.v[j];
+            if (drop) {
+                char *text = prompt_omit_images(r->prompt_text, all, drop);
+                if (!text) count_ok = false;
+                else { free(r->prompt_text); r->prompt_text = text; }
+            }
+            const char *cursor = r->prompt_text;
+            for (size_t i = drop; count_ok && i < count; i++) {
+                const char *marker = strstr(cursor, all[i]->marker);
+                uint32_t span = 0;
+                if (!marker) { count_ok = false; break; }
+                char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
+                ds4_tokenize_rendered_chat(e, prefix, &r->prompt);
+                free(prefix);
+                if (!server_count_image(s, all[i], (uint32_t)r->prompt.len, &span, err, errlen)) { count_ok = false; break; }
+                if ((uint64_t)r->prompt.len + span > INT_MAX) { count_ok = false; break; }
+                for (uint32_t n = 0; n < span; n++) ds4_tokens_push(&r->prompt, 0);
+                cursor = marker + strlen(all[i]->marker);
+            }
+            if (count_ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
+            free(all);
+        }
+    }
+    if (!count_ok || (!counted && !request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen))) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
         request_free(r);
@@ -4632,6 +4677,11 @@ bad:
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
+}
+
+static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+                               int ctx_size, request *r, char *err, size_t errlen) {
+    return parse_chat_request_counted(e, s, body, def_tokens, ctx_size, r, err, errlen, false);
 }
 
 static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
@@ -10558,6 +10608,30 @@ static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
 }
 
+/* Read only cached dimensions/counts, never duplicate the embedding buffer. */
+static bool server_count_image(server *s, const server_image_input *input,
+                               uint32_t start, uint32_t *span, char *err, size_t errlen) {
+    if (!s) { snprintf(err, errlen, "image counting requires a running server"); return false; }
+    const server_model_syntax syntax = server_model_syntax_for_engine(s->engine);
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN || syntax == SERVER_MODEL_SYNTAX_GLM) {
+        bool found = false;
+        server_inference_lock(s);
+        for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+            const server_image_cache_entry *entry = &s->image_cache.entries[i];
+            if (entry->encoded && entry->encoded_len == input->encoded_len &&
+                !memcmp(entry->encoded, input->encoded, input->encoded_len)) {
+                *span = entry->embedding.token_count + 2u;
+                found = true;
+                break;
+            }
+        }
+        server_inference_unlock(s);
+        if (found) return true;
+    }
+    return ds4_engine_vision_count_memory(s->engine, input->encoded, input->encoded_len,
+                                          start, span, err, errlen) != 0;
+}
+
 /* The caller holds inference_mu across cache lookup and encoder execution. */
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
@@ -13374,7 +13448,8 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
  * Count compute turns, not tokens or wall time: MTP and prefill have different
  * costs. A summary turn is bounded separately below. */
 #define ATOMIC_FOREGROUND_WEIGHT 8u
-#define ATOMIC_SUMMARY_PREFILL_QUANTUM 128
+#define ATOMIC_SUMMARY_PREFILL_QUANTUM 2048
+#define ATOMIC_SCHEDULED_MIXED_QUANTUM 512
 
 static int server_next_priority_slot_locked(const server *s) {
     if (!s || !s->dedicated_summary_slot || s->slot_count < 2) return -1;
@@ -13494,16 +13569,17 @@ static int server_prefill_quantum(server *s, const server_slot *slot) {
     bool generation_active = s->active_generations > 0;
     const bool recovery = s->dedicated_summary_slot && slot->id == s->slot_count - 1 &&
         slot->running && slot->running->req.atomic_summary && slot->running->req.atomic_summary_recovery;
-    const bool clone = s->atomic_clone_enabled && slot->id == s->slot_count - 1 &&
-        slot->running && slot->running->req.atomic_summary_clone;
-    const bool foreground_waiting = s->slots[0].prefill_waiting || s->slots[0].decode_pending;
+    const bool summary = s->dedicated_summary_slot && slot->id == s->slot_count - 1;
+    const bool scheduled = summary && slot->running && slot->running->req.atomic_background_task;
+    const bool foreground_waiting = s->slots[0].running || s->slots[0].prefill_waiting || s->slots[0].decode_pending;
     pthread_mutex_unlock(&s->model_mu);
-    if (recovery) return 2048;
-    if (clone) return foreground_waiting ? 1 : 2048;
+    if (recovery) return ATOMIC_SUMMARY_PREFILL_QUANTUM;
+    /* Idle background work uses the normal engine input block. A scheduled
+     * task keeps meaningful progress while chat is active; ordinary summaries
+     * yield after a single input. Weighted compute turns still arbitrate both. */
+    if (summary) return foreground_waiting ? (scheduled ? ATOMIC_SCHEDULED_MIXED_QUANTUM : 1)
+                                           : ATOMIC_SUMMARY_PREFILL_QUANTUM;
     int quantum = server_prefill_quantum_for(s, generation_active);
-    /* Always bound the summary, even if chat arrives after this calculation. */
-    if (s->dedicated_summary_slot && slot->id == s->slot_count - 1 &&
-        quantum > ATOMIC_SUMMARY_PREFILL_QUANTUM) quantum = ATOMIC_SUMMARY_PREFILL_QUANTUM;
     return quantum;
 }
 
@@ -17057,14 +17133,15 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
-    const bool count_only = !strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/atomic/summary-token-count");
+    const bool prompt_count = !strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/atomic/prompt-token-count");
+    const bool count_only = prompt_count || (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/atomic/summary-token-count"));
     const int ctx_size = s->ctx_size;
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && (!strcmp(hr.path, "/v1/chat/completions") || count_only)) {
-        ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
-                                ctx_size, &req, err, sizeof(err));
+        ok = parse_chat_request_counted(s->engine, s, hr.body, s->default_tokens,
+                                ctx_size, &req, err, sizeof(err), count_only);
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -17080,7 +17157,7 @@ static void *client_main(void *arg) {
         /* Counting is CPU-only: no slot, KV state, sampling or tool execution.
          * The normal chat parser owns template and tokenizer fidelity. */
         if (!ok) http_error(fd, s->enable_cors, 400, err);
-        else if (!req.atomic_summary || req.image_count || req.has_tools)
+        else if (req.image_count || (prompt_count ? req.atomic_summary : (!req.atomic_summary || req.has_tools)))
             http_error(fd, s->enable_cors, 400, "summary token counting requires text-only summary messages without tools");
         else {
             /* Counts include oversized raw-history probes: they are CPU-only,
@@ -17091,8 +17168,15 @@ static void *client_main(void *arg) {
                        "[summary-diag] event=token-count input_tokens=%d context=%d",
                        req.prompt.len, request_context_limit(s, &req));
             buf counted = {0};
+            if (prompt_count) {
+                int reserve = req.atomic_output_reserve;
+                if (req.max_tokens > 0 && reserve > req.max_tokens) reserve = req.max_tokens;
+                buf_printf(&counted, "{\"input_tokens\":%d,\"context_length\":%d,\"reserved_tokens\":%d}",
+                           req.prompt.len, request_context_limit(s, &req), reserve);
+            } else {
             buf_printf(&counted, "{\"input_tokens\":%d,\"context_length\":%d}",
                        req.prompt.len, request_context_limit(s, &req));
+            }
             http_response(fd, s->enable_cors, 200, "application/json", counted.ptr);
             buf_free(&counted);
         }
@@ -18070,7 +18154,10 @@ static void test_summary_weighted_prefill_threads(void) {
     TEST_ASSERT(server_next_priority_slot_locked(&s) == 1);
     urgent.req.atomic_summary_recovery = false;
     TEST_ASSERT(server_next_priority_slot_locked(&s) == 0);
-    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == ATOMIC_SUMMARY_PREFILL_QUANTUM);
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == 1);
+    urgent.req.atomic_background_task = true;
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == ATOMIC_SCHEDULED_MIXED_QUANTUM);
+    urgent.req.atomic_background_task = false;
     slots[1].running = NULL; slots[0].decode_pending = false; slots[1].prefill_waiting = false;
     priority_prefill_test tasks[2] = {{&s, &slots[0], 800, 0}, {&s, &slots[1], 100, 0}};
     pthread_t threads[2];
