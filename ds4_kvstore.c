@@ -1,4 +1,5 @@
 #include "ds4_kvstore.h"
+#include "ds4_cache_threads.h"
 
 /* Shared disk KV checkpoint file support.
  *
@@ -1009,6 +1010,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
+    char thread_id[129];
+    if (hooks && cache_thread_id(hooks->cache_owner, thread_id) && cache_thread_deleted(path, thread_id)) {
+        free(text); free(path); ds4_tokens_free(&store_tokens); return false;
+    }
 
     /* Equal rendered text does not authenticate equal approximate recurrent
      * state. Publish this actual frontier before binding its restart receipt. */
@@ -1017,10 +1022,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
+        bool owned = cache_threads_record(path, hooks ? hooks->cache_owner : NULL);
+        if (!owned) unlink(path);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
-        return true;
+        return owned;
     }
 
     /* Measure without serializing first. Write the payload once into the
@@ -1175,6 +1182,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
+    }
+    if (ok) {
+        ok = cache_threads_record(path, hooks ? hooks->cache_owner : NULL);
+        if (!ok) unlink(path);
     }
     free(tmp);
     free(text);

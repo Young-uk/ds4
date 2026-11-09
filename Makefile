@@ -103,13 +103,14 @@ ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OB
 
 # Model-free scheduler qualification; deliberately separate from model tests.
 .PHONY: test-summary-scheduler
-test-summary-scheduler: ds4_server_test tests/test_summary_scheduler_fake tests/test_cached_summary_fake tests/test_history_payload
+test-summary-scheduler: ds4_server_test tests/test_summary_scheduler_fake tests/test_cached_summary_fake tests/test_history_payload tests/test_cache_threads
 	./ds4_server_test
 	./tests/test_summary_scheduler_fake
 	./tests/test_cached_summary_fake
 	./tests/test_history_payload
+	./tests/test_cache_threads
 
-ds4_server_test: ds4_server.c ds4_atomic_summary.h $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
+ds4_server_test: ds4_server.c ds4_cache_threads.h ds4_atomic_summary.h $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_SERVER_TEST -o $@ ds4_server.c ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 tests/test_summary_scheduler_fake: tests/test_summary_scheduler_fake.c ds4_server.c ds4_atomic_summary.h $(CORE_OBJS) ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
@@ -559,7 +560,7 @@ ds4_prompt_prefix.o: ds4_prompt_prefix.c ds4_prompt_prefix.h ds4.h
 ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_gpu_args.c
 
-ds4_server.o: ds4_server.c ds4_atomic_summary.h ds4_resumable.h ds4_atomic_summary.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+ds4_server.o: ds4_server.c ds4_cache_threads.h ds4_atomic_summary.h ds4_resumable.h ds4_atomic_summary.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
@@ -577,7 +578,7 @@ ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h d
 ds4_web.o: ds4_web.c ds4_web.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_web.c
 
-ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_ssd.h
+ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4_cache_threads.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
 
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4_resumable.h ds4_atomic_summary.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
@@ -1162,3 +1163,7 @@ ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
 # Model-independent validation of exact/approximate payload format gates.
 tests/test_history_payload: tests/test_history_payload.c ds4_history_payload.h ds4.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_history_payload.c
+
+# Model-free conversation ownership and deletion races.
+tests/test_cache_threads: tests/test_cache_threads.c ds4_cache_threads.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_cache_threads.c

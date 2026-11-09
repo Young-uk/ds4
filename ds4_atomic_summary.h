@@ -220,7 +220,10 @@ static void atomic_cache_persist(server *s, server_slot *slot, const ds4_tokens 
     char sha[41]; ds4_kvstore_sha1_bytes_hex(text, strlen(text), sha); free(text);
     char *file = ds4_kvstore_path_for_sha(&s->kv, sha), identity[160];
     struct stat st;
-    if (lstat(file, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1) { free(file); return; }
+    char thread_id[129];
+    const bool thread_owned = cache_thread_id(slot->atomic_cache_owner, thread_id);
+    if ((thread_owned && cache_thread_deleted(file, thread_id)) ||
+        lstat(file, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1) { free(file); return; }
     atomic_file_identity(&st, identity); free(file);
     buf body = {0}; buf_puts(&body, "{\"owner\":"); json_escape(&body, slot->atomic_cache_owner);
     buf_puts(&body, ",\"history_hash\":"); json_escape(&body, slot->atomic_history_hash);
@@ -238,6 +241,8 @@ static void atomic_cache_persist(server *s, server_slot *slot, const ds4_tokens 
             if (close(fd)) ok = false;
             if (!ok || rename(temp.ptr, path)) unlink(temp.ptr);
         }
+        /* A deletion can land between our payload check and receipt rename. */
+        if (thread_owned && cache_thread_deleted(path, thread_id)) unlink(path);
         buf_free(&temp); free(path);
     }
     buf_free(&body);

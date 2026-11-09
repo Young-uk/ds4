@@ -4,6 +4,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_cache_threads.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -10367,6 +10368,7 @@ struct server_slot {
     uint64_t history_summary_hash;
     /* inference_mu owns this exact completed text frontier and UI attestation. */
     char *atomic_cache_owner;
+    char *disk_cache_owner; /* Owner of resident state, also valid without clone receipts. */
     char atomic_history_hash[65];
     int atomic_cache_tokens;
     uint64_t atomic_cache_hash;
@@ -11729,6 +11731,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     }
     s->kv.protected_anchor_path = fixed_path;
     s->kv.protected_restore_path = protected_path;
+    hooks.cache_owner = slot->disk_cache_owner;
     hooks.require_current_payload = s->atomic_clone_enabled && slot->id == 0 &&
         slot->atomic_cache_owner && slot->atomic_history_hash[0] && tokens->len == slot->atomic_cache_tokens;
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
@@ -15047,6 +15050,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * under a tight budget, skip the save rather than destroy the restore. */
         kv_cache_store_current_for_request(s, slot, "evict", j->req.prompt_text);
     }
+    if (!j->req.atomic_summary) {
+        pthread_mutex_lock(&s->inference_mu);
+        free(slot->disk_cache_owner);
+        slot->disk_cache_owner = j->req.atomic_cache_owner ? xstrdup(j->req.atomic_cache_owner) : NULL;
+        pthread_mutex_unlock(&s->inference_mu);
+    }
     if (cached == 0) {
         disk_cached = kv_cache_try_load_history(s, slot, &j->req,
                                                 &effective_prompt, &disk_cache_path);
@@ -15055,6 +15064,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
         if (disk_cached > 0) {
+            /* Shared byte-prefix checkpoints also belong to the conversation
+             * which actually restored them, not only their original writer. */
+            if (disk_cache_path && slot->disk_cache_owner) {
+                pthread_mutex_lock(&s->kv_mu);
+                (void)cache_threads_record(disk_cache_path, slot->disk_cache_owner);
+                pthread_mutex_unlock(&s->kv_mu);
+            }
             cached = disk_cached;
             cache_source = disk_history ? "disk-history" : "disk-text";
             prompt_for_sync = &effective_prompt;
@@ -17278,6 +17294,7 @@ static void server_close_resources(server *s) {
         free(slot->live_text);
         free(slot->anchor_text);
         free(slot->atomic_cache_owner);
+        free(slot->disk_cache_owner);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
