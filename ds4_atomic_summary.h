@@ -251,7 +251,7 @@ static bool atomic_clone_prepare(server *s, server_slot *slot, job *j, char *err
     request *r = &j->req;
     if (!s->atomic_clone_enabled || slot->id != s->slot_count - 1 || !r->atomic_summary ||
         r->api != API_OPENAI || r->kind != REQ_CHAT || r->image_count || r->has_tools ||
-        r->think_mode != DS4_THINK_NONE || r->max_tokens <= 0 || r->max_tokens > 2048) {
+        r->think_mode != DS4_THINK_NONE || r->max_tokens < 0) {
         snprintf(err, errlen, "cached summary requires a supported text-only Qwen Metal summary slot"); return false;
     }
     ds4_tokens separator = {0};
@@ -267,7 +267,7 @@ static bool atomic_clone_prepare(server *s, server_slot *slot, job *j, char *err
         uint64_t bytes = ds4_session_payload_bytes(source->session);
         const ds4_tokens *tokens = ds4_session_tokens(source->session);
         if (!bytes ||
-            (int64_t)tokens->len + 1 + separator.len + r->prompt.len + r->max_tokens > ds4_session_ctx(slot->session)) {
+            (int64_t)tokens->len + 1 + separator.len + r->prompt.len + (r->max_tokens > 0 ? r->max_tokens : 1) > ds4_session_ctx(slot->session)) {
             snprintf(err, errlen, "cached summary exceeds snapshot or context headroom");
         } else {
             ds4_tokens_copy(&combined, tokens); tail = source->atomic_cache_tail;
@@ -276,7 +276,7 @@ static bool atomic_clone_prepare(server *s, server_slot *slot, job *j, char *err
     } else if (atomic_receipt_read(s, &receipt) && !strcmp(receipt.owner, r->atomic_summary_clone)) {
         ds4_kvstore_entry header = {0}; FILE *fp = atomic_receipt_open(s, &receipt, &header);
         if (fp && header.payload_bytes > 0 &&
-            (int64_t)receipt.tokens + 1 + separator.len + r->prompt.len + r->max_tokens <= ds4_session_ctx(slot->session)) {
+            (int64_t)receipt.tokens + 1 + separator.len + r->prompt.len + (r->max_tokens > 0 ? r->max_tokens : 1) <= ds4_session_ctx(slot->session)) {
             ok = ds4_session_load_payload(slot->session, fp, header.payload_bytes, err, errlen) == 0;
             const ds4_tokens *tokens = ds4_session_tokens(slot->session);
             ok = ok && tokens && tokens->len == receipt.tokens && atomic_tokens_hash(tokens) == receipt.hash;

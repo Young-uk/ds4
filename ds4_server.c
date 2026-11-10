@@ -4419,6 +4419,7 @@ static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *bod
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_messages = false;
+    bool got_output_budget = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
@@ -4490,6 +4491,7 @@ static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *bod
                 free(key);
                 goto bad;
             }
+            got_output_budget = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4592,9 +4594,10 @@ static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *bod
         request_free(r);
         return false;
     }
+    if (r->atomic_summary && !got_output_budget) r->max_tokens = 0;
     if (r->atomic_summary_recovery && !r->atomic_summary) goto bad;
     if (r->atomic_background_task && !r->atomic_summary) goto bad;
-    if (r->atomic_summary_clone && (!r->atomic_summary || r->max_tokens <= 0 || r->max_tokens > 2048 || r->ignore_eos)) goto bad;
+    if (r->atomic_summary_clone && (!r->atomic_summary || r->max_tokens < 0 || r->ignore_eos)) goto bad;
     /* Detect a real historical handoff change, not an ordinary cache miss. */
     for (int i = 0; i < msgs.len; i++) {
         if (!qwen_historical_summary(&msgs.v[i])) continue;
@@ -12237,7 +12240,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
     ds4_tokens prompt = {0};
     ds4_tokens_copy(&prompt, live);
     const char *cursor = suffix;
-    const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
+    const int wrapper = (ds4_engine_is_glm_dsa(s->engine) ||
+                         ds4_engine_is_qwen4(s->engine)) ? 1 : 0;
     for (size_t i = old_count; i < req->image_count; i++) {
         const char *marker = strstr(cursor, req->image_markers[i]);
         int64_t start = (int64_t)req->images[i].token_start - wrapper;
@@ -13775,6 +13779,12 @@ static int server_decode_budget(int requested, int generated, int room) {
     if (requested <= generated || room <= 0) return 0;
     int remaining = requested - generated;
     return remaining < room ? remaining : room;
+}
+
+/* A zero summary output cap uses the slot's real remaining capacity. */
+static int server_request_decode_budget(const request *r, int generated, int room) {
+    if (r->atomic_summary && r->max_tokens == 0) return room > 0 ? room : 0;
+    return server_decode_budget(r->max_tokens, generated, room);
 }
 
 static bool empty_qwen_chat_reply(const request *r, const char *content,
@@ -15578,8 +15588,8 @@ decode_again:
     const char *finish = "length";
     int completion = 0;
     int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
-    int max_tokens = server_decode_budget(j->req.max_tokens,
-                                          recovery_completion, room);
+    int max_tokens = server_request_decode_budget(&j->req,
+                                                  recovery_completion, room);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
@@ -21915,6 +21925,15 @@ static void test_tool_recovery_output_budget(void) {
     TEST_ASSERT(server_decode_budget(24, 0, -1) == 0);
     TEST_ASSERT(server_decode_budget(-1, 0, 100) == 0);
     TEST_ASSERT(server_decode_budget(INT_MAX, INT_MAX - 1, INT_MAX) == 1);
+    request summary = {0};
+    summary.atomic_summary = true;
+    TEST_ASSERT(server_request_decode_budget(&summary, 0, 8192) == 8192);
+    TEST_ASSERT(server_request_decode_budget(&summary, 2500, 4096) == 4096);
+    TEST_ASSERT(server_request_decode_budget(&summary, 2500, 0) == 0);
+    summary.atomic_summary = false;
+    TEST_ASSERT(server_request_decode_budget(&summary, 0, 8192) == 0);
+    summary.atomic_summary = true; summary.max_tokens = 32;
+    TEST_ASSERT(server_request_decode_budget(&summary, 0, 8192) == 32);
     /* Logging malformed, short tool output must not subtract from its length. */
     TEST_ASSERT(find_any_tool_start("<tool_call>") != NULL);
     TEST_ASSERT(find_any_tool_start("<tool_call") == NULL);

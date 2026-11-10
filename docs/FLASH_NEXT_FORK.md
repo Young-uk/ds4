@@ -108,6 +108,13 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   to 327). The first two leave the output byte for byte the same; the last
   one is more accurate than the tile it replaces and `DS4_QWEN4_MOE_REG=0`
   turns it off.
+- **Half activations in the Q2_0 expert tiles.** The register tiles stage
+  x and mid in half, as the staged tiles on other chips do, and fold the
+  block scale into the weights, so each tile reads half the activation
+  bytes and the next K step's activations load during the multiplies.
+  Prefill goes from 379 to 397 tok/s at 8K on the GPU alone and from 499 to
+  530 with the Neural Engine (363 to 380 and 473 to 501 at 32K); the NLL
+  stays within the noise. `DS4_QWEN4_MOE_REG_HALF=0` keeps fp32 activations.
 
 Each change is a separate commit with a test.
 
@@ -306,3 +313,12 @@ a later restart may therefore restore an earlier exact snapshot.
 Model-backed regression: `tests/test_qwen4_disk_history_restart.py` uses a
 separate synthetic cache, shuts down before removing earlier turns, then checks
 both disk-history restoration and the next live follow-up.
+
+## Personal integration, 2026-11-10
+
+The personal branch imports upstream register-tile prerequisites `4d5bbb9` and
+`bff3010`, IQ codebook tiles `991b1ff`, decode kernels `578be4f`, and the
+Qwen image-wrapper fix `5c63fe2`. The existing IQ1_M dispatch remains available.
+This integration keeps the current KV layout and checkpoint interval; it does
+not import int8 KV `220251f` or checkpoint-spacing policy `69fb93a`.
+Synthetic kernel and frontend tests do not establish real-model throughput.

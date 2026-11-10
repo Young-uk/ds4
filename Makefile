@@ -1037,6 +1037,16 @@ else
 	$(DS4_LINK) -o $@ ds4_agent_test.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(DS4_LINK_LIBS)
 endif
 
+tests/test_server_vision_suffix.o: tests/test_server_vision_suffix.c ds4_server.c ds4.h ds4_kvstore.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_server_vision_suffix: tests/test_server_vision_suffix.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
 tests/test_prompt_prefix.o: tests/test_prompt_prefix.c ds4_prompt_prefix.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -1044,8 +1054,9 @@ tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 .PHONY: test-frontends
-test-frontends: ds4_test ds4_agent_test test-web-recovery
+test-frontends: ds4_test ds4_agent_test test-web-recovery tests/test_server_vision_suffix
 	./ds4_test --server
+	./tests/test_server_vision_suffix
 	./ds4_agent_test
 	python3 tests/test_dstar_launcher.py
 
