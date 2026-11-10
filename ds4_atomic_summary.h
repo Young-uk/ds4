@@ -247,6 +247,85 @@ static void atomic_cache_persist(server *s, server_slot *slot, const ds4_tokens 
     buf_free(&body);
 }
 
+/* Match the CPU-only source envelope to the bound native prefix. Image rows
+ * are already folded into state; expand placeholders only with its UI receipt. */
+static int atomic_source_end(server *s, const request *r, const ds4_tokens *main,
+                             const char *history_hash) {
+    const ds4_tokens *prefix = &r->atomic_source_prefix;
+    if (!main || !prefix->len) return -1;
+    ds4_tokens pad = {0}; ds4_tokenize_rendered_chat(s->engine, "<|image_pad|>", &pad);
+    int at = 0;
+    for (int i = 0; i < prefix->len; ++i) {
+        if (at >= main->len || prefix->v[i] != main->v[at++]) { at = -1; break; }
+        if (pad.len == 1 && prefix->v[i] == pad.v[0]) {
+            if (!atomic_hex(history_hash, 64) || !r->atomic_source_history_hash ||
+                strcmp(history_hash, r->atomic_source_history_hash)) { at = -1; break; }
+            while (at < main->len && main->v[at] == pad.v[0]) ++at;
+        }
+    }
+    ds4_tokens_free(&pad); return at;
+}
+
+/* Native full payloads own recurrent/GDN, PLE, indexer and image positions.
+ * Loading into the disposable summary slot never rewinds the foreground. */
+static bool atomic_checkpoint_prepare(server *s, server_slot *slot, request *r,
+        const ds4_tokens *main, const char *history_hash, int suffix_tokens,
+        ds4_tokens *combined, int *tail, char *err, size_t errlen) {
+    if (!s->kv.enabled || !r->atomic_source_prefix.len) return false;
+    int end = atomic_source_end(s, r, main, history_hash);
+    if (end <= 0) return false;
+    const int model = ds4_engine_model_id(s->engine), quant = ds4_engine_routed_quant_bits(s->engine);
+    const int ctx = ds4_session_ctx(slot->session);
+    bool ok = false;
+    pthread_mutex_lock(&s->kv_mu);
+    /* Refresh the existing bounded disk index, including after restart. */
+    (void)ds4_kvstore_find_text_prefix(&s->kv, "", model, quant, s->ctx_size);
+    uint32_t previous = 0; int previous_index = -1;
+    for (int attempt = 0; attempt < s->kv.len && !ok; ++attempt) {
+        ds4_kvstore_entry *chosen = NULL; int chosen_index = -1;
+        for (int i = 0; i < s->kv.len; ++i) {
+            ds4_kvstore_entry *e = &s->kv.entry[i];
+            if ((e->tokens < previous || (e->tokens == previous && i <= previous_index)) || e->tokens < (uint32_t)end || e->tokens >= (uint32_t)main->len ||
+                e->model_id != model || e->quant_bits != quant || e->ctx_size > (uint32_t)s->ctx_size ||
+                (int64_t)e->tokens + suffix_tokens + (r->max_tokens > 0 ? r->max_tokens : 4096) > ctx ||
+                !e->payload_bytes || !e->text_bytes || e->text_bytes > 16 * 1024 * 1024) continue;
+            if (!chosen || e->tokens < chosen->tokens) { chosen = e; chosen_index = i; }
+        }
+        if (!chosen) break;
+        previous = chosen->tokens; previous_index = chosen_index;
+        int fd = open(chosen->path, O_RDONLY | O_NOFOLLOW);
+        if (fd < 0) continue;
+        FILE *fp = fdopen(fd, "rb"); if (!fp) { close(fd); continue; }
+        struct stat st; ds4_kvstore_entry h = {0}; uint32_t bytes = 0;
+        bool valid = !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_nlink == 1 &&
+            ds4_kvstore_read_header(fp, &h, &bytes) && h.tokens == chosen->tokens &&
+            h.model_id == model && h.quant_bits == quant && h.ctx_size <= (uint32_t)s->ctx_size &&
+            bytes == chosen->text_bytes && h.payload_bytes == chosen->payload_bytes &&
+            h.payload_bytes <= (uint64_t)st.st_size && (uint64_t)bytes <= (uint64_t)st.st_size;
+        char *text = valid ? xmalloc((size_t)bytes) : NULL;
+        if (valid) valid = fread(text, 1, bytes, fp) == bytes;
+        if (valid) { char sha[41]; ds4_kvstore_sha1_bytes_hex(text, bytes, sha); valid = !strcmp(sha, chosen->sha); }
+        free(text);
+        if (valid) ds4_session_invalidate(slot->session);
+        if (valid && ds4_session_load_payload(slot->session, fp, h.payload_bytes, err, errlen) == 0) {
+            const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+            ok = tokens && tokens->len == (int)h.tokens && ds4_session_checkpoint_valid(slot->session) &&
+                tokens->len >= end && tokens->len < main->len &&
+                !memcmp(tokens->v, main->v, (size_t)tokens->len * sizeof(int));
+            if (ok) {
+                ds4_tokens_copy(combined, tokens); *tail = main->v[tokens->len];
+                server_log(DS4_LOG_KVCACHE,
+                    "[summary-diag] event=checkpoint-clone source_tokens=%d archived_end=%d main_tokens=%d",
+                    tokens->len, end, main->len);
+                err[0] = 0;
+            }
+        }
+        fclose(fp);
+        if (!ok) ds4_session_invalidate(slot->session);
+    }
+    pthread_mutex_unlock(&s->kv_mu); return ok;
+}
+
 static bool atomic_clone_prepare(server *s, server_slot *slot, job *j, char *err, size_t errlen) {
     request *r = &j->req;
     if (!s->atomic_clone_enabled || slot->id != s->slot_count - 1 || !r->atomic_summary ||
@@ -263,24 +342,42 @@ static bool atomic_clone_prepare(server *s, server_slot *slot, job *j, char *err
     server_slot *source = &s->slots[0]; ds4_tokens combined = {0};
     atomic_receipt receipt = {0};
     bool ok = false; int tail = -1;
+    const int suffix_tokens = 1 + separator.len + r->prompt.len;
+    ds4_tokens main = {0}; const char *history_hash = NULL;
     if (atomic_cache_matches(source, r->atomic_summary_clone)) {
         uint64_t bytes = ds4_session_payload_bytes(source->session);
         const ds4_tokens *tokens = ds4_session_tokens(source->session);
-        if (!bytes ||
+        ds4_tokens_copy(&main, tokens); history_hash = source->atomic_history_hash;
+        if (r->max_tokens == 0 && (int64_t)tokens->len + suffix_tokens + 4096 > ds4_session_ctx(slot->session))
+            ok = atomic_checkpoint_prepare(s, slot, r, &main, history_hash, suffix_tokens, &combined, &tail, err, errlen);
+        if (ok) { /* The selected checkpoint already owns its complete state. */ }
+        else if (!bytes ||
             (int64_t)tokens->len + 1 + separator.len + r->prompt.len + (r->max_tokens > 0 ? r->max_tokens : 1) > ds4_session_ctx(slot->session)) {
             snprintf(err, errlen, "cached summary exceeds snapshot or context headroom");
+            ok = atomic_checkpoint_prepare(s, slot, r, &main, history_hash, suffix_tokens, &combined, &tail, err, errlen);
         } else {
             ds4_tokens_copy(&combined, tokens); tail = source->atomic_cache_tail;
             ok = ds4_session_clone_state(slot->session, source->session, err, errlen) == 0;
         }
     } else if (atomic_receipt_read(s, &receipt) && !strcmp(receipt.owner, r->atomic_summary_clone)) {
         ds4_kvstore_entry header = {0}; FILE *fp = atomic_receipt_open(s, &receipt, &header);
-        if (fp && header.payload_bytes > 0 &&
-            (int64_t)receipt.tokens + 1 + separator.len + r->prompt.len + (r->max_tokens > 0 ? r->max_tokens : 1) <= ds4_session_ctx(slot->session)) {
+        if (fp && header.payload_bytes > 0 && receipt.tokens < ds4_session_ctx(slot->session)) {
             ok = ds4_session_load_payload(slot->session, fp, header.payload_bytes, err, errlen) == 0;
             const ds4_tokens *tokens = ds4_session_tokens(slot->session);
             ok = ok && tokens && tokens->len == receipt.tokens && atomic_tokens_hash(tokens) == receipt.hash;
-            if (ok) { ds4_tokens_copy(&combined, tokens); tail = receipt.tail; }
+            if (ok) {
+                ds4_tokens_copy(&main, tokens); history_hash = receipt.history;
+                const int64_t available = (int64_t)ds4_session_ctx(slot->session) - main.len - suffix_tokens;
+                if (available < (r->max_tokens > 0 ? r->max_tokens : 4096)) {
+                    ok = atomic_checkpoint_prepare(s, slot, r, &main, history_hash, suffix_tokens, &combined, &tail, err, errlen);
+                    if (!ok && available >= (r->max_tokens > 0 ? r->max_tokens : 1)) {
+                        /* A failed candidate load invalidates only this slot. */
+                        fclose(fp); fp = atomic_receipt_open(s, &receipt, &header);
+                        ok = fp && ds4_session_load_payload(slot->session, fp, header.payload_bytes, err, errlen) == 0;
+                        if (ok) { ds4_tokens_copy(&combined, &main); tail = receipt.tail; }
+                    }
+                } else { ds4_tokens_copy(&combined, tokens); tail = receipt.tail; }
+            }
         }
         if (fp) fclose(fp);
     }
@@ -301,7 +398,7 @@ static bool atomic_clone_prepare(server *s, server_slot *slot, job *j, char *err
         ok = false; ds4_session_invalidate(slot->session);
         if (!err[0]) snprintf(err, errlen, "completed conversation cache is unavailable; originals retained");
     }
-    ds4_tokens_free(&combined); ds4_tokens_free(&separator); server_prefill_leave(s);
+    ds4_tokens_free(&main); ds4_tokens_free(&combined); ds4_tokens_free(&separator); server_prefill_leave(s);
     return ok;
 }
 

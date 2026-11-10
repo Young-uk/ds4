@@ -824,6 +824,8 @@ typedef struct {
     bool atomic_background_task;
     char *atomic_cache_owner;
     char *atomic_summary_clone;
+    char *atomic_checkpoint_source, *atomic_source_history_hash;
+    ds4_tokens atomic_source_prefix;
     /* Opt-in foreground reserve; legacy OpenAI clients keep their old boundary. */
     int atomic_output_reserve;
     uint64_t history_summary_hash;
@@ -1040,6 +1042,8 @@ static void request_free(request *r) {
     free(r->model);
     free(r->atomic_cache_owner);
     free(r->atomic_summary_clone);
+    free(r->atomic_checkpoint_source); free(r->atomic_source_history_hash);
+    ds4_tokens_free(&r->atomic_source_prefix);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
     free(r->raw_body);
@@ -3773,7 +3777,7 @@ static void append_qwen_generation_prompt(buf *out, bool think) {
 }
 
 static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
-                                     const tool_schema_orders *tool_orders, bool think) {
+                                     const tool_schema_orders *tool_orders, bool think, bool generation) {
     bool pending_assistant = false;
     bool tool_open = false;
     tool_schema_orders recorded_orders = {0};
@@ -3852,14 +3856,14 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
         }
     }
     if (tool_open) buf_puts(out, "<|im_end|>\n");
-    if (pending_assistant) append_qwen_generation_prompt(out, think);
+    if (generation && pending_assistant) append_qwen_generation_prompt(out, think);
     tool_schema_orders_free(&recorded_orders);
 }
 
-static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
+static char *render_qwen_chat_prompt_mode(const chat_msgs *msgs,
                                           const char *tool_schemas,
                                           const tool_schema_orders *tool_orders,
-                                          ds4_think_mode think_mode) {
+                                          ds4_think_mode think_mode, bool generation) {
     const bool think = ds4_think_mode_enabled(think_mode);
     ds4_think_mode latest_update;
     const bool append_only = qwen_latest_effort_update(msgs, &latest_update);
@@ -3893,8 +3897,13 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
         buf_puts(&out, "<|im_end|>\n");
     }
     buf_free(&system);
-    append_qwen_conversation(&out, msgs, 0, tool_orders, think);
+    append_qwen_conversation(&out, msgs, 0, tool_orders, think, generation);
     return buf_take(&out);
+}
+
+static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *tools,
+        const tool_schema_orders *orders, ds4_think_mode think) {
+    return render_qwen_chat_prompt_mode(msgs, tools, orders, think, true);
 }
 
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
@@ -3947,6 +3956,22 @@ static char *prompt_omit_images(const char *text, server_image_input **images, s
     }
     buf_puts(&b, cursor);
     return buf_take(&b);
+}
+
+static bool request_tokenize_checkpoint_source(ds4_engine *e, request *r, const chat_msgs *msgs) {
+    const char *cursor = r->prompt_text;
+    buf text = {0};
+    for (int i = 0; msgs && i < msgs->len; ++i) for (size_t j = 0; j < msgs->v[i].images.len; ++j) {
+        const char *marker = msgs->v[i].images.v[j].marker;
+        const char *at = strstr(cursor, marker);
+        if (!at) { buf_free(&text); return false; }
+        buf_append(&text, cursor, (size_t)(at - cursor));
+        buf_puts(&text, "<|vision_start|><|image_pad|><|vision_end|>");
+        cursor = at + strlen(marker);
+    }
+    buf_puts(&text, cursor);
+    ds4_tokenize_rendered_chat(e, text.ptr, &r->prompt);
+    buf_free(&text); return true;
 }
 
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
@@ -4153,7 +4178,7 @@ static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
                                         ds4_think_mode think_mode) {
     buf out = {0};
     buf_puts(&out, "<|im_end|>\n");
-    append_qwen_conversation(&out, msgs, start, tool_orders, ds4_think_mode_enabled(think_mode));
+    append_qwen_conversation(&out, msgs, start, tool_orders, ds4_think_mode_enabled(think_mode), true);
     return buf_take(&out);
 }
 
@@ -4414,7 +4439,7 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
 static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen, bool count_only) {
+                               int ctx_size, request *r, char *err, size_t errlen, bool count_only, bool history_only) {
     request_init(r, REQ_CHAT, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
@@ -4472,6 +4497,10 @@ static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *bod
             if (!json_int(&p, &r->atomic_output_reserve) || r->atomic_output_reserve < 0 || r->atomic_output_reserve > 65536) { free(key); goto bad; }
         } else if (!strcmp(key, "atomic_cache_owner")) {
             if (!json_string_replace(&p, &r->atomic_cache_owner) || !r->atomic_cache_owner[0] || strlen(r->atomic_cache_owner) > 512) { free(key); goto bad; }
+        } else if (!strcmp(key, "atomic_summary_checkpoint_source")) {
+            if (history_only || r->atomic_checkpoint_source || !json_raw_value(&p, &r->atomic_checkpoint_source)) { free(key); goto bad; }
+        } else if (history_only && !strcmp(key, "history_hash")) {
+            if (!json_string_replace(&p, &r->atomic_source_history_hash)) { free(key); goto bad; }
         } else if (!strcmp(key, "atomic_summary_clone")) {
             if (!json_string_replace(&p, &r->atomic_summary_clone) || !r->atomic_summary_clone[0] || strlen(r->atomic_summary_clone) > 512) { free(key); goto bad; }
         } else if (!strcmp(key, "atomic_background_task")) {
@@ -4623,7 +4652,9 @@ static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *bod
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_echoes_reasoning = chat_history_echoes_reasoning(&msgs);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
+    if (history_only && r->model_syntax != SERVER_MODEL_SYNTAX_QWEN) goto bad;
+    r->prompt_text = history_only ? render_qwen_chat_prompt_mode(&msgs, active_tool_schemas,
+        &r->tool_orders, r->think_mode, false) : render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
     bool counted = false, count_ok = true;
@@ -4665,7 +4696,8 @@ static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *bod
             free(all);
         }
     }
-    if (!count_ok || (!counted && !request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen))) {
+    if (!count_ok || (!counted && !(history_only ? request_tokenize_checkpoint_source(e, r, &msgs) :
+        request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)))) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
         request_free(r);
@@ -4673,6 +4705,14 @@ static bool parse_chat_request_counted(ds4_engine *e, server *s, const char *bod
     }
     chat_msgs_free(&msgs);
     free(tool_schemas);
+    if (r->atomic_checkpoint_source) {
+        request source = {0};
+        if (!r->atomic_summary_clone || !parse_chat_request_counted(e, s, r->atomic_checkpoint_source,
+            0, ctx_size, &source, err, errlen, false, true)) { request_free(r); return false; }
+        r->atomic_source_prefix = source.prompt; memset(&source.prompt, 0, sizeof(source.prompt));
+        r->atomic_source_history_hash = source.atomic_source_history_hash; source.atomic_source_history_hash = NULL;
+        request_free(&source);
+    }
     return true;
 bad:
     chat_msgs_free(&msgs);
@@ -4684,7 +4724,7 @@ bad:
 
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
-    return parse_chat_request_counted(e, s, body, def_tokens, ctx_size, r, err, errlen, false);
+    return parse_chat_request_counted(e, s, body, def_tokens, ctx_size, r, err, errlen, false, false);
 }
 
 static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
@@ -16950,7 +16990,7 @@ static bool send_models(server *s, int fd) {
     buf_printf(&b, "{\"object\":\"list\",\"atomic_summary_slot\":%s,\"atomic_completion_review\":true,\"atomic_tool_preamble\":4,\"atomic_summary_context\":16384,\"atomic_summary_token_count\":true,",
                s->dedicated_summary_slot && s->slot_count > 1 ? "true" : "false");
     if (s->atomic_clone_enabled) {
-        buf_puts(&b, "\"atomic_summary_clone\":true,\"atomic_summary_stream_progress\":true,\"runtime_id\":");
+        buf_puts(&b, "\"atomic_summary_clone\":true,\"atomic_summary_checkpoint_recovery\":true,\"atomic_summary_stream_progress\":true,\"runtime_id\":");
         json_escape(&b, s->atomic_runtime_id);
         buf_puts(&b, ",\"atomic_model_fingerprint\":"); json_escape(&b, s->atomic_model_fingerprint);
         buf_putc(&b, ',');
@@ -17151,7 +17191,7 @@ static void *client_main(void *arg) {
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && (!strcmp(hr.path, "/v1/chat/completions") || count_only)) {
         ok = parse_chat_request_counted(s->engine, s, hr.body, s->default_tokens,
-                                ctx_size, &req, err, sizeof(err), count_only);
+                                ctx_size, &req, err, sizeof(err), count_only, false);
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -20525,6 +20565,12 @@ static void test_render_qwen_chat_prompt_text(void) {
     char *prompt = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_QWEN, &msgs, tool_schemas, &orders, DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
+    char *history_only = render_qwen_chat_prompt_mode(&msgs, tool_schemas, &orders, DS4_THINK_HIGH, false);
+    TEST_ASSERT(history_only && strlen(history_only) < strlen(prompt));
+    TEST_ASSERT(!strncmp(prompt, history_only, strlen(history_only)));
+    TEST_ASSERT(strstr(history_only, "<|im_start|>user\nHello<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(history_only, "<|im_start|>assistant") == NULL);
+    free(history_only);
     TEST_ASSERT(!strncmp(prompt, "<|im_start|>system\nReasoning effort is set to xhigh.", 52));
     TEST_ASSERT(strstr(prompt, "\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
                                "{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": "
