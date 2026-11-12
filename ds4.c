@@ -60842,11 +60842,7 @@ typedef struct ds4_dspark_spec_stats {
 
 #endif
 
-typedef struct {
-    uint32_t token_start;
-    uint32_t token_count;
-    uint8_t fingerprint[32];
-} ds4_vision_identity;
+typedef ds4_history_image ds4_vision_identity;
 
 struct ds4_session {
     bool history_approximate; /* Diagnostic retained-history KV; never serialize as exact. */
@@ -63116,6 +63112,8 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         const uint32_t rows = (uint32_t)s->checkpoint.len;
         const uint32_t mtp_rows = s->qwen4_graph.mtp_pos < rows ? s->qwen4_graph.mtp_pos : rows;
         bytes += qwen4_payload_tensor_bytes(rows, mtp_rows);
+        if (s->history_approximate && s->checkpoint_image_count)
+            bytes += 4u + (uint64_t)s->checkpoint_image_count * 40u;
         return bytes;
 #endif
     }
@@ -63320,12 +63318,11 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows) {
 }
 
 static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
-    /* Version three labels approximate recurrent history explicitly. All tensor
-     * rows, absolute positions and mrope_delta already belong to this payload;
-     * ordinary version-two snapshots remain byte-for-byte unchanged. */
+    /* v3 labels text approximations; v4 appends visual ownership to the same
+     * tensors and three-axis positions. Ordinary v2 snapshots stay unchanged. */
     if (s->history_approximate && (s->engine->backend != DS4_BACKEND_METAL ||
-        s->checkpoint_image_count || s->sync_image_count || s->distributed)) {
-        payload_set_err(err, errlen, "approximate history snapshots require text-only Qwen Metal");
+        s->sync_image_count || s->distributed)) {
+        payload_set_err(err, errlen, "approximate history snapshots require drained Qwen Metal");
         return 1;
     }
     if (!s->qwen4_graph_ready || s->qwen4_rewound ||
@@ -63345,7 +63342,7 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
     }
     uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC,
-        s->history_approximate ? DS4_SESSION_HISTORY_PAYLOAD_VERSION : DS4_SESSION_PAYLOAD_VERSION,
+        s->history_approximate ? (s->checkpoint_image_count ? DS4_SESSION_VISUAL_HISTORY_PAYLOAD_VERSION : DS4_SESSION_HISTORY_PAYLOAD_VERSION) : DS4_SESSION_PAYLOAD_VERSION,
         (uint32_t)s->ctx_size,
         s->prefill_cap,
         g->ctx_cap,
@@ -63400,6 +63397,15 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
     if (rc == 0) {
         rc = payload_write_tensor_span(fp, g->pos3, 0, (uint64_t)rows * 16u,
                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
+    if (rc == 0 && header[1] == DS4_SESSION_VISUAL_HISTORY_PAYLOAD_VERSION) {
+        rc = payload_write_u32(fp, (uint32_t)s->checkpoint_image_count, err, errlen);
+        for (size_t i = 0; !rc && i < s->checkpoint_image_count; i++) {
+            const ds4_vision_identity *image = &s->checkpoint_images[i];
+            rc = payload_write_u32(fp, image->token_start, err, errlen);
+            if (!rc) rc = payload_write_u32(fp, image->token_count, err, errlen);
+            if (!rc) rc = payload_write_bytes(fp, image->fingerprint, 32, err, errlen);
+        }
     }
     free(buf);
     return rc;
@@ -63507,10 +63513,26 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
             rc = 1;
         }
     }
-    if (rc == 0 && h[1] == DS4_SESSION_HISTORY_PAYLOAD_VERSION) {
+    ds4_vision_identity *visual_images = NULL;
+    uint32_t visual_count = 0;
+    if (rc == 0 && (h[1] == DS4_SESSION_HISTORY_PAYLOAD_VERSION || h[1] == DS4_SESSION_VISUAL_HISTORY_PAYLOAD_VERSION)) {
         uint32_t *positions = xmalloc((size_t)rows * 16u);
         rc = payload_read_bytes(fp, positions, (uint64_t)rows * 16u, remaining, err, errlen);
-        if (rc == 0 && !ds4_history_positions_valid(positions, rows, g->mrope_delta)) {
+        if (!rc && h[1] == DS4_SESSION_VISUAL_HISTORY_PAYLOAD_VERSION) {
+            rc = payload_read_u32(fp, &visual_count, remaining, err, errlen);
+            if (!rc && (!visual_count || visual_count > rows || (uint64_t)visual_count*40u > *remaining)) rc = 1;
+            if (!rc) visual_images = xcalloc(visual_count, sizeof(*visual_images));
+            for (uint32_t i = 0; !rc && i < visual_count; i++) {
+                rc = payload_read_u32(fp, &visual_images[i].token_start, remaining, err, errlen);
+                if (!rc) rc = payload_read_u32(fp, &visual_images[i].token_count, remaining, err, errlen);
+                if (!rc) rc = payload_read_bytes(fp, visual_images[i].fingerprint, 32, remaining, err, errlen);
+            }
+        }
+        const bool valid_positions = rc == 0 && (h[1] == DS4_SESSION_VISUAL_HISTORY_PAYLOAD_VERSION
+            ? ds4_history_visual_positions_valid(positions, new_checkpoint.v, rows, g->mrope_delta,
+                visual_images, visual_count, s->engine->vision_image_token)
+            : ds4_history_positions_valid(positions, rows, g->mrope_delta));
+        if (rc == 0 && !valid_positions) {
             payload_set_err(err, errlen, "invalid approximate history text positions");
             rc = 1;
         }
@@ -63522,12 +63544,16 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     }
     free(buf);
     if (rc != 0) {
+        free(visual_images);
         token_vec_free(&new_checkpoint);
         qwen4_graph_reset(g);
         s->checkpoint.len = 0;
         return 1;
     }
-    s->history_approximate = h[1] == DS4_SESSION_HISTORY_PAYLOAD_VERSION;
+    free(s->checkpoint_images);
+    s->checkpoint_images = visual_images;
+    s->checkpoint_image_count = visual_count;
+    s->history_approximate = h[1] == DS4_SESSION_HISTORY_PAYLOAD_VERSION || h[1] == DS4_SESSION_VISUAL_HISTORY_PAYLOAD_VERSION;
     g->pos = rows;
     g->mtp_pos = mtp_rows;
     token_vec_free(&s->checkpoint);
@@ -76100,7 +76126,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
         if (s->checkpoint_valid &&
-            !(s->history_approximate && s->sync_image_count) &&
+            (!s->history_approximate || ds4_session_vision_prefix_matches(s, s->sync_images, s->sync_image_count)) &&
             s->qwen4_graph.pos == (uint32_t)s->checkpoint.len &&
             (!s->qwen4_rewound || prompt->len > s->checkpoint.len) &&
             prompt->len >= s->checkpoint.len &&
@@ -86034,8 +86060,17 @@ bool ds4_session_history_compact(ds4_session *s, int first, int end, int keep_en
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     if (!s->qwen4_graph_ready || g->pos != (uint32_t)s->checkpoint.len) return false;
     const int n = s->checkpoint.len, tail = keep_end - end, removed = n - first - tail;
-    if ((int64_t)g->mrope_delta + removed > INT32_MAX) return false;
     if (!ds4_gpu_synchronize()) return false;
+    /* The discarded suffix can contain images. Its final delta is not the
+     * frontier of the retained text; read that authoritative row instead. */
+    uint32_t frontier_row[4];
+    int64_t frontier = (int64_t)g->pos + g->mrope_delta;
+    if (keep_end < n) {
+        if (!ds4_gpu_tensor_read(g->pos3, (uint64_t)keep_end*16u, frontier_row, 16u)) return false;
+        frontier = frontier_row[0];
+    }
+    const int64_t delta = frontier - (first+tail);
+    if (frontier < 0 || frontier > INT32_MAX || delta < INT32_MIN || delta > INT32_MAX) return false;
     const size_t cap = 1024 * 1024;
     unsigned char *scratch = xmalloc(cap);
     bool ok = history_move_rows(g->pos3, first, end, tail, 16, scratch, cap);
@@ -86062,7 +86097,7 @@ bool ds4_session_history_compact(ds4_session *s, int first, int end, int keep_en
     free(s->checkpoint_images); s->checkpoint_images = NULL; s->checkpoint_image_count = 0;
     s->sync_images = NULL; s->sync_image_count = 0;
     g->pos -= removed;
-    g->mrope_delta += removed; /* future tokens follow the old absolute frontier */
+    g->mrope_delta = (int32_t)delta; /* fresh rows follow the retained absolute frontier */
     g->snap_valid = g->snap2_valid = g->snap0_valid = g->anchor_valid = false;
     g->mtp_pos = 0;
     g->mtp_last_rows = 0;

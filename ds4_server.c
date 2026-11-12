@@ -12193,36 +12193,45 @@ static bool multimodal_disk_prefix_matches(const request *req,
                (size_t)loaded->len * sizeof(*loaded->v)) == 0;
 }
 
+/* Prefer an authenticated full visual prefix before a shorter historical
+ * text approximation. Otherwise every restart rereads the image and its tail. */
+static int kv_cache_try_load_visual(server *s, server_slot *slot, const request *req,
+        ds4_tokens *effective_prompt, char **loaded_path_out) {
+    if (!s->kv.enabled || !req || !req->image_count) return 0;
+    char *key = multimodal_disk_key(req);
+    ds4_kvstore_load_result result = {0};
+    pthread_mutex_lock(&s->inference_mu);
+    pthread_mutex_lock(&s->kv_mu);
+    ds4_session_invalidate(slot->session);
+    int restored = ds4_kvstore_try_load_text(&s->kv, s->engine,
+        slot->session, key, NULL, &result, NULL, false, true);
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    if (restored > 0 && tokens && restored <= req->prompt.len &&
+        memcmp(tokens->v, req->prompt.v, (size_t)restored * sizeof(*tokens->v)) == 0 &&
+        (ds4_session_has_vision_state(slot->session)
+            ? ds4_session_vision_state_matches(slot->session, req->images, req->image_count)
+            : ds4_session_restore_disk_vision(slot->session, req->images, req->image_count))) {
+        ds4_tokens_free(effective_prompt);
+        ds4_tokens_copy(effective_prompt, &req->prompt);
+        if (loaded_path_out && result.path) *loaded_path_out = xstrdup(result.path);
+    } else if (restored > 0) {
+        ds4_session_invalidate(slot->session);
+        restored = 0;
+    }
+    pthread_mutex_unlock(&s->kv_mu);
+    pthread_mutex_unlock(&s->inference_mu);
+    ds4_kvstore_load_result_free(&result);
+    free(key);
+    return restored;
+}
+
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
     if (req && req->image_count) {
-        if (s->kv.enabled) {
-            char *key = multimodal_disk_key(req);
-            ds4_kvstore_load_result result = {0};
-            pthread_mutex_lock(&s->inference_mu);
-            pthread_mutex_lock(&s->kv_mu);
-            ds4_session_invalidate(slot->session);
-            int restored = ds4_kvstore_try_load_text(&s->kv, s->engine,
-                slot->session, key, NULL, &result, NULL, false, true);
-            const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-            if (restored > 0 && tokens && restored <= req->prompt.len &&
-                memcmp(tokens->v, req->prompt.v, (size_t)restored * sizeof(*tokens->v)) == 0 &&
-                ds4_session_restore_disk_vision(slot->session, req->images, req->image_count)) {
-                ds4_tokens_free(effective_prompt);
-                ds4_tokens_copy(effective_prompt, &req->prompt);
-                if (loaded_path_out && result.path) *loaded_path_out = xstrdup(result.path);
-            } else if (restored > 0) {
-                ds4_session_invalidate(slot->session);
-                restored = 0;
-            }
-            pthread_mutex_unlock(&s->kv_mu);
-            pthread_mutex_unlock(&s->inference_mu);
-            ds4_kvstore_load_result_free(&result);
-            free(key);
-            if (restored > 0) return restored;
-        }
+        int visual = kv_cache_try_load_visual(s, slot, req, effective_prompt, loaded_path_out);
+        if (visual > 0) return visual;
         if (!req->prompt_text || !req->image_markers) return 0;
         const char *marker = strstr(req->prompt_text, req->image_markers[0]);
         if (!marker) return 0;
@@ -14723,7 +14732,7 @@ static void *decode_worker_main(void *arg) {
 typedef struct { int prefix, source, length; } history_cache_plan;
 static history_cache_plan history_cache_match(const ds4_tokens *old,
                                               const ds4_tokens *next,
-                                              int turn_start, int fixed) {
+                                              int turn_start, int fixed, int image_start) {
     history_cache_plan best = {0};
     if (!old || !next || fixed < 1 || fixed >= next->len || fixed >= old->len ||
         memcmp(old->v, next->v, (size_t)fixed * sizeof(int))) return best;
@@ -14741,6 +14750,10 @@ static history_cache_plan history_cache_match(const ds4_tokens *old,
         int count = seed;
         while (source + count < old->len && prefix + count < next->len &&
                old->v[source + count] == next->v[prefix + count]) count++;
+        if (image_start >= 0) {
+            const int text_rows = image_start - 1 - prefix;
+            if (text_rows < count) count = text_rows;
+        }
         /* Always prefill at least one new token before sampling stale logits. */
         if (count >= minimum && prefix + count < next->len && count > best.length)
             best = (history_cache_plan){prefix, source, count};
@@ -14782,6 +14795,22 @@ static void history_cache_log_boundary(ds4_engine *engine, int slot,
         regions[0], regions[1]);
 }
 
+/* Read only the bounded token table for candidate selection. Visual rendered
+ * text contains markers rather than the expanded image rows. The chosen
+ * snapshot is still checked by the native payload reader before any reuse. */
+static bool history_payload_tokens(FILE *fp, uint64_t bytes, uint32_t rows, ds4_tokens *out) {
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+    if (!rows || rows > INT_MAX || bytes < sizeof(h)+(uint64_t)rows*4u ||
+        fread(h, sizeof(h), 1, fp) != 1 || h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
+        (h[1] != DS4_SESSION_PAYLOAD_VERSION && h[1] != DS4_SESSION_HISTORY_PAYLOAD_VERSION && h[1] != DS4_SESSION_VISUAL_HISTORY_PAYLOAD_VERSION) || h[7] != rows) return false;
+    for (uint32_t i = 0; i < rows; i++) {
+        uint32_t token;
+        if (fread(&token, sizeof(token), 1, fp) != 1 || token > INT_MAX) return false;
+        ds4_tokens_push(out, (int)token);
+    }
+    return true;
+}
+
 /* Restart counterpart of live history compaction. Only an explicit Personal
  * summary permits approximate reuse; authenticate the file and recheck exact
  * payload tokens before moving graph rows. Never delete rejected snapshots. */
@@ -14789,7 +14818,7 @@ static int kv_cache_try_load_history(server *s, server_slot *slot, request *req,
                                     ds4_tokens *effective, char **path_out) {
     if (!history_cache_enabled() || !s->dedicated_summary_slot || !s->kv.enabled ||
         req->kind != REQ_CHAT || req->api != API_OPENAI || req->atomic_summary ||
-        req->image_count || !req->history_summary_hash || !req->prompt_text) return 0;
+        !req->history_summary_hash || !req->prompt_text) return 0;
     const int fixed = prompt_system_run_for_request(s, req, &req->prompt);
     if (fixed < 1) return 0;
     pthread_mutex_lock(&s->inference_mu);
@@ -14812,9 +14841,12 @@ static int kv_cache_try_load_history(server *s, server_slot *slot, request *req,
         FILE *fp = fopen(e->path, "rb");
         ds4_kvstore_entry hdr = {0}; uint32_t bytes = 0;
         if (!fp) continue;
-        bool valid = ds4_kvstore_read_header(fp, &hdr, &bytes) && bytes == e->text_bytes;
+        bool valid = ds4_kvstore_read_header(fp, &hdr, &bytes) && bytes == e->text_bytes &&
+            hdr.tokens == e->tokens && hdr.tokens <= (uint32_t)ctx;
         char *text = valid ? xmalloc((size_t)bytes + 1) : NULL;
         if (valid) valid = fread(text, 1, bytes, fp) == bytes;
+        ds4_tokens tokens = {0};
+        if (valid) valid = history_payload_tokens(fp, hdr.payload_bytes, hdr.tokens, &tokens);
         fclose(fp);
         if (valid) {
             text[bytes] = 0;
@@ -14822,10 +14854,8 @@ static int kv_cache_try_load_history(server *s, server_slot *slot, request *req,
             valid = !strcmp(sha, e->sha) && strlen(text) == bytes;
         }
         if (valid) {
-            ds4_tokens tokens = {0};
-            ds4_tokenize_rendered_chat(s->engine, text, &tokens);
             history_cache_plan plan = history_cache_match(&tokens, &req->prompt,
-                ds4_token_turn_start(s->engine), fixed);
+                ds4_token_turn_start(s->engine), fixed, req->image_count ? (int)req->images[0].token_start : -1);
             server_log(DS4_LOG_DEFAULT,
                 "[history-cache-candidate] slot=%d snapshot_tokens=%u prefix=%d retained=%d source=%d reuse=%d previous_best=%d selected=%d",
                 slot->id, hdr.tokens, plan.prefix, plan.length, plan.source,
@@ -14836,8 +14866,8 @@ static int kv_cache_try_load_history(server *s, server_slot *slot, request *req,
                 free(chosen); chosen = xstrdup(e->path);
                 memcpy(chosen_sha, e->sha, sizeof(chosen_sha));
             }
-            ds4_tokens_free(&tokens);
         }
+        ds4_tokens_free(&tokens);
         free(text);
     }
     int loaded = 0;
@@ -14859,7 +14889,7 @@ static int kv_cache_try_load_history(server *s, server_slot *slot, request *req,
                                                err, sizeof(err)) == 0) {
             const ds4_tokens *tokens = ds4_session_tokens(slot->session);
             history_cache_plan plan = history_cache_match(tokens, &req->prompt,
-                ds4_token_turn_start(s->engine), fixed);
+                ds4_token_turn_start(s->engine), fixed, req->image_count ? (int)req->images[0].token_start : -1);
             /* Inspect authenticated payload tokens before compaction changes
              * them, exactly as for live-history reuse. */
             history_cache_log_boundary(s->engine, slot->id,
@@ -14869,7 +14899,7 @@ static int kv_cache_try_load_history(server *s, server_slot *slot, request *req,
                                             plan.source + plan.length)) {
                 loaded = plan.prefix + plan.length;
                 ds4_tokens_free(effective);
-                ds4_tokenize_rendered_chat(s->engine, req->prompt_text, effective);
+                ds4_tokens_copy(effective, &req->prompt);
                 ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
                 if (hooks.load && (hdr.ext_flags & hooks.ext_flag))
                     hooks.load(hooks.ud, fp, hooks.load_wanted);
@@ -14946,14 +14976,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     bool history_compacted = false;
     if (history_cache_enabled() && s->dedicated_summary_slot &&
         slot->history_request_seen && j->req.kind == REQ_CHAT &&
-        j->req.api == API_OPENAI && !j->req.atomic_summary && !multimodal &&
+        j->req.api == API_OPENAI && !j->req.atomic_summary &&
         j->req.history_summary_hash &&
         j->req.history_summary_hash != slot->history_summary_hash) {
         const int fixed = prompt_system_run_for_request(s, &j->req, &j->req.prompt);
         pthread_mutex_lock(&s->inference_mu);
         const history_cache_plan plan = history_cache_match(
             ds4_session_tokens(slot->session), &j->req.prompt,
-            ds4_token_turn_start(s->engine), fixed);
+            ds4_token_turn_start(s->engine), fixed, j->req.image_count ? (int)j->req.images[0].token_start : -1);
         history_cache_log_boundary(s->engine, slot->id,
             ds4_session_tokens(slot->session), &j->req.prompt, plan);
         if (plan.length && ds4_session_checkpoint_valid(slot->session))
@@ -15197,10 +15227,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         pthread_mutex_unlock(&s->inference_mu);
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load_history(s, slot, &j->req,
+        disk_cached = kv_cache_try_load_visual(s, slot, &j->req,
                                                 &effective_prompt, &disk_cache_path);
-        const bool disk_history = disk_cached > 0;
-        if (!disk_history) disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
+        bool disk_history = false;
+        if (disk_cached == 0) {
+            disk_cached = kv_cache_try_load_history(s, slot, &j->req,
+                                                    &effective_prompt, &disk_cache_path);
+            disk_history = disk_cached > 0;
+        }
+        if (disk_cached == 0) disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
         if (disk_cached > 0) {
@@ -20696,17 +20731,20 @@ static void test_history_cache_match(void) {
     memcpy(b, a, 100 * sizeof(int));
     memcpy(b + 100, a + 400, 700 * sizeof(int));
     ds4_tokens old = {.v=a, .len=1500}, next = {.v=b, .len=1200};
-    history_cache_plan p = history_cache_match(&old, &next, 7, 100);
+    history_cache_plan p = history_cache_match(&old, &next, 7, 100, -1);
     TEST_ASSERT(p.prefix == 100 && p.source == 400 && p.length == 700);
+    history_cache_plan visual = history_cache_match(&old, &next, 7, 100, 702);
+    TEST_ASSERT(visual.prefix == 100 && visual.source == 400 && visual.length == 601);
+    TEST_ASSERT(history_cache_match(&old, &next, 7, 100, 101).length == 0);
     b[0]++;
-    TEST_ASSERT(history_cache_match(&old, &next, 7, 100).length == 0);
+    TEST_ASSERT(history_cache_match(&old, &next, 7, 100, -1).length == 0);
     b[0]--;
     b[500]++;
-    TEST_ASSERT(history_cache_match(&old, &next, 7, 100).length == 0);
+    TEST_ASSERT(history_cache_match(&old, &next, 7, 100, -1).length == 0);
     b[500]--;
     next.len = 800; /* No new token to replace stale logits. */
-    TEST_ASSERT(history_cache_match(&old, &next, 7, 100).length == 0);
-    TEST_ASSERT(history_cache_match(NULL, &next, 7, 100).length == 0);
+    TEST_ASSERT(history_cache_match(&old, &next, 7, 100, -1).length == 0);
+    TEST_ASSERT(history_cache_match(NULL, &next, 7, 100, -1).length == 0);
 }
 
 static void test_qwen_historical_summary_stays_at_recorded_position(void) {

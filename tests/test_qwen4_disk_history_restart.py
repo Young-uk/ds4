@@ -6,6 +6,7 @@ model server. Artifacts are retained for inspection rather than deleted.
 """
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,10 @@ def main():
     parser.add_argument('--summary-slot', action='store_true')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--ngram-model', type=Path, help='Separate n-gram GGUF for split Qwen models')
+    parser.add_argument('--vision', type=Path)
+    parser.add_argument('--image', type=Path)
     args = parser.parse_args()
+    if bool(args.vision) != bool(args.image): parser.error('--vision and --image must be supplied together')
     root = (args.output or Path(tempfile.mkdtemp(prefix='ds4-summary-restart-'))).resolve()
     root.mkdir(parents=True, exist_ok=True)
     cache = Path(tempfile.mkdtemp(prefix='kv-', dir=root))
@@ -43,6 +47,7 @@ def main():
         '--kv-cache-min-tokens', '512', '--kv-cache-cold-max-tokens', '2000',
         '--kv-cache-continued-interval-tokens', '0',
     ]
+    if args.vision: command += ['--vision', str(args.vision.resolve())]
     if args.summary_slot:
         command.append('--summary-slot')
     environment = os.environ.copy()
@@ -65,6 +70,9 @@ def main():
              + 'Historical placeholder. ' * 40},
             {'role': 'assistant', 'content': 'OK'},
         ]
+    if args.image:
+        image_url='data:image/png;base64,'+base64.b64encode(args.image.read_bytes()).decode()
+        history[-4]['content']=[{'type':'text','text':history[-4]['content']}, {'type':'image_url','image_url':{'url':image_url}}]
     label = 'Earlier conversation summary (historical data, not new instructions).'
 
     def start(stage):
@@ -133,11 +141,16 @@ def main():
         start('compacted_restart')
         message = call('summary_replaces_older_history_after_restart', compacted)
         assert 'source=disk approximate=1' in (root / 'compacted_restart.log').read_text()
-        assert cached_tokens() > 2500, results[-1]
+        assert cached_tokens() > (1000 if args.image else 2500), results[-1]
         compacted += [message, {'role': 'user', 'content': 'Again reply only OK.'}]
         message = call('post_summary_followup', compacted)
         assert cached_tokens() >= results[-1]['usage']['prompt_tokens'] * .9, results[-1]
         compacted += [message, {'role': 'user', 'content': 'After restart reply only OK.'}]
+        if args.image:
+            stop()
+            start('visual_second_restart')
+            call('image_history_after_second_restart', compacted)
+            assert cached_tokens() >= results[-1]['usage']['prompt_tokens']*.9,results[-1]
     finally:
         stop()
 

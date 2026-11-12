@@ -433,9 +433,9 @@ static bool atomic_history_plan(server *s, int fd, const char *body) {
             buf_putc(&request_body, '}'); request request = {0}; char err[160];
             if (!parse_chat_request(s->engine, s, request_body.ptr, s->default_tokens, s->ctx_size, &request, err, sizeof(err))) valid = false;
             else {
-                if (!request.image_count && (int64_t)request.prompt.len + 4096 <= s->ctx_size * 0.8) {
+                if ((int64_t)request.prompt.len + 4096 <= s->ctx_size * 0.8) {
                     plan = history_cache_match(&old, &request.prompt, ds4_token_turn_start(s->engine),
-                        prompt_system_run_for_request(s, &request, &request.prompt));
+                        prompt_system_run_for_request(s, &request, &request.prompt), request.image_count ? (int)request.images[0].token_start : -1);
                     if (plan.length) selected = boundary;
                 }
                 request_free(&request);

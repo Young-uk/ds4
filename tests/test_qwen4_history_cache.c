@@ -9,13 +9,69 @@
 
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "failed: %s at %d\n", #x, __LINE__); return 1; } } while (0)
 
+static int visual_restart(ds4_engine *e) {
+    char err[256] = "";
+    ds4_vision_embedding embedding = {0};
+    const int encoded=ds4_engine_vision_encode_file(e, getenv("DS4_TEST_IMAGE"), &embedding, err, sizeof(err));
+    if(!encoded) fprintf(stderr,"vision: %s\n",err);
+    REQUIRE(encoded == 1);
+    ds4_session *session = NULL;
+    REQUIRE(ds4_session_create(&session, e, 4096) == 0);
+    ds4_tokens source = {0}, suffix = {0};
+    char text[12000] = "Synthetic image history. ";
+    for (int i=0;i<100;i++) strcat(text,"Stable text before the recent picture. ");
+    ds4_encode_chat_prompt(e,"Inspect the picture.",text,DS4_THINK_NONE,&source);
+    ds4_vision_span span = {0};
+    REQUIRE(ds4_prompt_append_vision(e,&source,&span,&embedding,err,sizeof(err)) == 1);
+    ds4_tokenize_text(e," Describe the picture briefly.",&suffix);
+    for(int j=0;j<suffix.len;j++) ds4_tokens_push(&source,suffix.v[j]);
+    REQUIRE(ds4_session_sync_multimodal(session,&source,&span,1,err,sizeof(err)) == 0);
+    const int keep_end=(int)span.token_start-1, first=29, end=200;
+    REQUIRE(keep_end>end+512);
+    REQUIRE(ds4_session_history_compact(session,first,end,keep_end));
+    const int cached=ds4_session_pos(session);
+    ds4_tokens follow={0};ds4_tokens_copy(&follow,ds4_session_tokens(session));
+    for(int j=keep_end;j<source.len;j++) ds4_tokens_push(&follow,source.v[j]);
+    span.token_start-=keep_end-cached;
+    REQUIRE(ds4_session_sync_multimodal(session,&follow,&span,1,err,sizeof(err)) == 0);
+    REQUIRE(ds4_session_history_approximate(session));
+    REQUIRE(ds4_session_vision_state_matches(session,&span,1));
+    const int vocab=ds4_engine_vocab_size(e);
+    float *before=malloc((size_t)vocab*sizeof(float)), *after=malloc((size_t)vocab*sizeof(float));
+    REQUIRE(before&&after);
+    for(int round=0;round<2;round++) {
+        REQUIRE(ds4_session_copy_logits(session,before,vocab)==vocab);
+        FILE *file=tmpfile();REQUIRE(file);
+        const uint64_t bytes=ds4_session_payload_bytes(session);
+        REQUIRE(ds4_session_save_payload(session,file,err,sizeof(err))==0);
+        REQUIRE((uint64_t)ftell(file)==bytes);
+        uint32_t header[2];rewind(file);REQUIRE(fread(header,sizeof(header),1,file)==1);
+        REQUIRE(header[1]==DS4_SESSION_VISUAL_HISTORY_PAYLOAD_VERSION);
+        ds4_session_free(session);session=NULL;
+        REQUIRE(ds4_session_create(&session,e,4096)==0);rewind(file);
+        REQUIRE(ds4_session_load_payload(session,file,bytes,err,sizeof(err))==0);fclose(file);
+        REQUIRE(ds4_session_copy_logits(session,after,vocab)==vocab);
+        REQUIRE(!memcmp(before,after,(size_t)vocab*sizeof(float)));
+        REQUIRE(ds4_session_history_approximate(session));
+        REQUIRE(ds4_session_vision_state_matches(session,&span,1));
+        REQUIRE(ds4_session_common_prefix(session,&follow)==follow.len);
+        ds4_tokens_push(&follow,ds4_session_argmax(session));
+        REQUIRE(ds4_session_sync_multimodal(session,&follow,&span,1,err,sizeof(err))==0);
+        REQUIRE(ds4_session_history_approximate(session));
+    }
+    printf("visual history: reused %d text rows; two v4 restores preserve logits, ownership and continuation\n",cached);
+    free(before);free(after);ds4_tokens_free(&source);ds4_tokens_free(&suffix);ds4_tokens_free(&follow);
+    ds4_vision_embedding_free(&span.embedding);ds4_session_free(session);return 0;
+}
+
 int main(void) {
     const char *path = getenv("DS4_TEST_MODEL");
     REQUIRE(path);
-    ds4_engine_options opt = {.model_path=path, .backend=DS4_BACKEND_METAL,
+    ds4_engine_options opt = {.model_path=path, .vision_path=getenv("DS4_TEST_VISION"), .backend=DS4_BACKEND_METAL,
         .context_size=8192, .prefill_chunk=512, .n_threads=1};
     ds4_engine *e = NULL;
     REQUIRE(ds4_engine_open(&e, &opt) == 0);
+    if (getenv("DS4_TEST_IMAGE")) { int rc=visual_restart(e); ds4_engine_close(e); return rc; }
     ds4_session *s = NULL;
     REQUIRE(ds4_session_create(&s, e, 8192) == 0);
     char question[10000] = "Old marker: COBALT.\n";

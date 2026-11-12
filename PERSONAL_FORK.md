@@ -257,3 +257,37 @@ The live retained-history test now includes an explicit v3 round trip into a
 larger session, but it is left for the user's manual run. No real model inference,
 Metal/SSD throughput, long-context peak memory, CUDA hardware or distributed
 inference benchmark is claimed by this port.
+
+### Visual retained-history handoffs and restart payloads (2026-11-12)
+
+The Personal historical matcher and boundary planner now stop reused text before
+an incoming image wrapper. The image and following tail are freshly evaluated;
+subsequent identical visual prefixes retain their computed three-axis positions.
+Compaction takes its fresh-tail frontier from the retained position map, since a
+discarded image suffix can have a different rotary delta.
+
+Approximate visual snapshots use explicit payload v4: the existing tensor/position
+layout plus bounded image spans and fingerprints. Restore checks complete grids,
+image ownership and the absolute frontier before publishing the checkpoint.
+Ordinary v2 and text-only approximate v3 layouts are unchanged. v3/v4 remain
+local Qwen Metal formats and are rejected by other backends and tensor parallel.
+Historical disk selection reads actual payload tokens instead of retokenizing
+visual marker text. An authenticated full visual prefix takes precedence over a
+shorter text approximation after restart.
+
+Validation on a 64 GiB M1 Max with ISTA IQ3_XXS, the original IQ4_NL n-gram
+sidecar read directly from SD, and the Q8 vision projector:
+
+- `make`, CPU core/server compilation, `ds4_test --server`, multimodal suffix
+  tests, and ASan/UBSan history-payload checks passed.
+- `tests/test_qwen4_history_cache.c` with `DS4_TEST_VISION` and `DS4_TEST_IMAGE`
+  reused 556 text rows and passed two v4 session restores with identical logits,
+  preserved image identities and continued approximate cache reuse.
+- `tests/test_qwen4_disk_history_restart.py --summary-slot --vision ... --image ...`
+  at 8K passed two complete server restarts. Summary handoff reused 2581/2840
+  prompt tokens; the next turn reused 2841/2860; the second restart reused
+  2840/2881. Every synthetic request answered `OK`.
+
+These are correctness/cache-reuse checks, not a general throughput benchmark.
+CUDA hardware, distributed inference and routed-expert SSD performance were not
+measured; their ordinary payload and inference paths were not changed.
