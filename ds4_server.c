@@ -3628,36 +3628,25 @@ static bool qwen_completion_review(const chat_msg *m) {
 
 static void append_qwen_tool_preamble_policy(buf *out) {
     buf_puts(out, "<|im_start|>system\n"
-        "Keep the user involved in the work by communicating your developing assessment at meaningful decision points. "
-        "When you have worked out that the next step depends on checking information or taking an action, "
-        "share the useful assessment you have reached so far and what you now need to establish, then continue the work. "
-        "The earlier catalog instruction to ONLY reply in the function-call format applies to the XML call block, "
-        "not to the user-facing part of your response. It must not suppress your developing assessment. "
-        "Make that assessment visible assistant content outside <think>, before the relevant tool call; "
-        "do not leave it only in private reasoning and jump directly to a tool. "
-        "Let the task, uncertainty, and conversation determine what to say and how much to say. "
-        "There is no fixed phrase, sentence count, or announcement template. "
-        "Do not mechanically narrate every tool call or repeat an update for a step you have already explained. "
-        "When you can answer directly, answer naturally without inventing a waiting stage or unnecessary check. "
-        "Use the user's language. Share user-facing conclusions and uncertainty, not private chain-of-thought. "
-        "Distinguish your current assessment from verified findings, and do not claim an action has succeeded before its result arrives. "
-        "An update does not require a new permission question; preserve existing approval requirements. "
-        "Any tool-call block must still use the required tool syntax."
+        "While working, speak naturally when you have a useful discovery, question, reaction, uncertainty, or change of approach to share with the user. "
+        "Keep your usual voice and personality, and use the user's language. "
+        "Do not follow a fixed announce-act-report pattern, announce every tool call, or speak on a timer. "
+        "It is fine to work quietly when there is nothing useful to say. "
+        "Share relevant remarks naturally; do not invent facts, repeat status, or force small talk. "
+        "Public remarks are normal visible assistant content, not private reasoning. Share observations and decisions, not an internal reasoning transcript. "
+        "The earlier catalog instruction to ONLY reply in the function-call format applies to the XML call block, not to the user-facing part of your response. "
+        "Distinguish uncertainty from verified findings. A remark does not require a new permission question; preserve existing approvals and tool syntax."
         "<|im_end|>\n");
 }
 
-/* A new event leaves the text of recorded v1 histories immutable. Natural
- * updates are useful progress, but are not a completed tool-dependent task. */
 static void append_qwen_tool_preamble_v2(buf *out) {
     buf_puts(out, "<|im_start|>system\n"
-        "Continue applying the earlier natural progress-update policy. "
-        "When your visible response describes work you still need to do, it is an interim update, not the final answer. "
-        "If you decide to check information with an available tool, emit its actual tool call in this same assistant turn after the update. "
-        "Do not stop the turn after saying you will check, search, fetch, calculate, or inspect something. "
-        "After the tool result, complete the user's request using the evidence, or clearly explain a real blocker. "
-        "Do not claim that a tool ran without a tool result. Do not invent tool calls or use private reasoning as evidence. "
-        "Direct answers need no tool, no waiting announcement, and no permission question unless approval is actually required. "
-        "Keep the wording natural to the conversation; there is no fixed phrase or sentence count."
+        "A visible remark is not a final answer. Continue the necessary thinking and authorized tool work until the request is complete, with thinking enabled or disabled. "
+        "When work requires an available tool, emit its actual tool call rather than ending with a promise or waiting for the user to prompt you again. "
+        "Use the tool results to finish with a verified outcome or a concrete blocker. "
+        "Do not invent tool calls, claim unobserved results, or use private reasoning as evidence. "
+        "Respect permissions, approvals, cancellations and denied actions. Direct answers need no tool or waiting announcement. "
+        "There is no fixed phrase, sentence count or requirement to speak before each tool."
         "<|im_end|>\n");
 }
 
@@ -20801,11 +20790,11 @@ static void test_qwen_prospective_tool_preamble(void) {
     append_effort_test_message(&msgs, "user", "Check a source.");
     char *after = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     TEST_ASSERT(!strncmp(before, after, strlen(before)));
-    TEST_ASSERT(strstr(after + strlen(before), "communicating your developing assessment at meaningful decision points") != NULL);
+    TEST_ASSERT(strstr(after + strlen(before), "While working, speak naturally") != NULL);
     TEST_ASSERT(strstr(after, "atomic-tool-preamble:v1") == NULL);
     buf v2 = {0};
     append_qwen_tool_preamble_v2(&v2);
-    TEST_ASSERT(strstr(v2.ptr, "actual tool call in this same assistant turn") != NULL);
+    TEST_ASSERT(strstr(v2.ptr, "emit its actual tool call rather than ending with a promise") != NULL);
     TEST_ASSERT(strstr(v2.ptr, "no fixed phrase") != NULL);
     buf_free(&v2);
     append_effort_test_message(&msgs, "assistant", "A source-based answer.");
@@ -20816,7 +20805,7 @@ static void test_qwen_prospective_tool_preamble(void) {
     TEST_ASSERT(!strncmp(v1_prefix, v3_prompt, strlen(v1_prefix)));
     TEST_ASSERT(strstr(v3_prompt, "today's weather, live or recently changing information") != NULL);
     TEST_ASSERT(strstr(v3_prompt, "do not enable them, invent calls") != NULL);
-    TEST_ASSERT(strstr(v3_prompt, "actual tool call in this same assistant turn") != NULL);
+    TEST_ASSERT(strstr(v3_prompt, "emit its actual tool call rather than ending with a promise") != NULL);
     append_effort_test_message(&msgs, "assistant", "Here is a method.");
     char *v3_prefix = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     append_effort_test_message(&msgs, "system", "atomic-tool-preamble:v4");
