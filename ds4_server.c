@@ -13492,7 +13492,7 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
  * Count compute turns, not tokens or wall time: MTP and prefill have different
  * costs. A summary turn is bounded separately below. */
 #define ATOMIC_FOREGROUND_WEIGHT 8u
-#define ATOMIC_SUMMARY_PREFILL_QUANTUM 2048
+#define SERVER_DEFAULT_PREFILL_QUANTUM 2048
 #define ATOMIC_SCHEDULED_MIXED_QUANTUM 512
 
 static int server_next_priority_slot_locked(const server *s) {
@@ -13598,17 +13598,29 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+static int server_input_workspace_cap(const server *s, const server_slot *slot) {
+    int cap = slot ? ds4_session_input_workspace_cap(slot->session) : 0;
+    if (cap <= 0 && s->engine) {
+        const uint32_t configured = ds4_engine_prefill_chunk(s->engine);
+        if (configured <= INT_MAX) cap = (int)configured;
+    }
+    return cap > 0 ? cap : SERVER_DEFAULT_PREFILL_QUANTUM;
+}
+
 static int server_prefill_quantum_for(const server *s,
-                                      bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+                                      bool generation_active, int workspace_cap) {
+    const int cap = workspace_cap > 0 ? workspace_cap : SERVER_DEFAULT_PREFILL_QUANTUM;
+    int quantum = generation_active ? s->mixed_prefill_quantum : cap;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
     }
-    return quantum;
+    if (quantum > cap) quantum = cap;
+    return quantum > 0 ? quantum : 1;
 }
 
 static int server_prefill_quantum(server *s, const server_slot *slot) {
+    const int workspace_cap = server_input_workspace_cap(s, slot);
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
     const bool recovery = s->dedicated_summary_slot && slot->id == s->slot_count - 1 &&
@@ -13617,13 +13629,16 @@ static int server_prefill_quantum(server *s, const server_slot *slot) {
     const bool scheduled = summary && slot->running && slot->running->req.atomic_background_task;
     const bool foreground_waiting = s->slots[0].running || s->slots[0].prefill_waiting || s->slots[0].decode_pending;
     pthread_mutex_unlock(&s->model_mu);
-    if (recovery) return ATOMIC_SUMMARY_PREFILL_QUANTUM;
+    if (recovery) return workspace_cap;
     /* Idle background work uses the normal engine input block. A scheduled
      * task keeps meaningful progress while chat is active; ordinary summaries
      * yield after a single input. Weighted compute turns still arbitrate both. */
-    if (summary) return foreground_waiting ? (scheduled ? ATOMIC_SCHEDULED_MIXED_QUANTUM : 1)
-                                           : ATOMIC_SUMMARY_PREFILL_QUANTUM;
-    int quantum = server_prefill_quantum_for(s, generation_active);
+    if (summary) {
+        const int quantum = foreground_waiting ? (scheduled ? ATOMIC_SCHEDULED_MIXED_QUANTUM : 1)
+                                                : workspace_cap;
+        return quantum < workspace_cap ? quantum : workspace_cap;
+    }
+    int quantum = server_prefill_quantum_for(s, generation_active, workspace_cap);
     return quantum;
 }
 
@@ -17868,8 +17883,8 @@ int main(int argc, char **argv) {
     s.qwen4_summary_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                          ds4_engine_is_qwen4(engine) && cfg.engine.glm_mtp;
     if (s.dedicated_summary_slot)
-        server_log(DS4_LOG_DEFAULT, "ds4-server: summary scheduler=weighted-quanta-v1 foreground_weight=%u summary_weight=1 summary_prefill_quantum=%d resident_sessions_preserved=true",
-                   ATOMIC_FOREGROUND_WEIGHT, ATOMIC_SUMMARY_PREFILL_QUANTUM);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: summary scheduler=weighted-quanta-v1 foreground_weight=%u summary_weight=1 summary_prefill_quantum=workspace-cap resident_sessions_preserved=true",
+                   ATOMIC_FOREGROUND_WEIGHT);
     if (s.qwen4_summary_mtp)
         server_log(DS4_LOG_DEFAULT, "ds4-server: greedy summary MTP verification enabled");
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
@@ -17930,8 +17945,8 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
                    s.slot_count,
-                   server_prefill_quantum_for(&s, false),
-                   server_prefill_quantum_for(&s, true),
+                   server_prefill_quantum_for(&s, false, server_input_workspace_cap(&s, &s.slots[0])),
+                   server_prefill_quantum_for(&s, true, server_input_workspace_cap(&s, &s.slots[0])),
                    server_decode_coalesce_us());
         if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
             server_log(DS4_LOG_DEFAULT,
@@ -18193,10 +18208,10 @@ static void test_summary_weighted_prefill_threads(void) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_mutex_init(&s.inference_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
-    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == ATOMIC_SUMMARY_PREFILL_QUANTUM);
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == SERVER_DEFAULT_PREFILL_QUANTUM);
     TEST_ASSERT(server_prefill_quantum(&s, &slots[0]) == 2048);
     s.active_generations = 1;
-    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == ATOMIC_SUMMARY_PREFILL_QUANTUM);
+    TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == SERVER_DEFAULT_PREFILL_QUANTUM);
     job urgent = {0}; urgent.req.atomic_summary = true; urgent.req.atomic_summary_recovery = true;
     slots[1].running = &urgent;
     TEST_ASSERT(server_prefill_quantum(&s, &slots[1]) == 2048);
@@ -18271,10 +18286,16 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
 
     server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
-    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
-    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
+    TEST_ASSERT(ds4_session_input_workspace_cap(NULL) == 0);
+    const int caps[] = {256, 2048, 4096, 8192};
+    for (size_t i = 0; i < sizeof(caps) / sizeof(caps[0]); i++)
+        TEST_ASSERT(server_prefill_quantum_for(&s, false, caps[i]) == caps[i]);
+    TEST_ASSERT(server_prefill_quantum_for(&s, false, 0) == SERVER_DEFAULT_PREFILL_QUANTUM);
+    TEST_ASSERT(server_prefill_quantum_for(&s, true, 4096) == 2048);
+    TEST_ASSERT(server_prefill_quantum_for(&s, true, 256) == 256);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
-    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+    TEST_ASSERT(server_prefill_quantum_for(&s, true, 4096) == 128);
+    TEST_ASSERT(server_prefill_quantum_for(&s, true, 64) == 64);
 }
 
 /* Reuse-aware slot routing: the probe must recognize every way a request

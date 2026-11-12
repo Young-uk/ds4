@@ -617,6 +617,9 @@ bool ds4_session_anchor_restore(ds4_session *s);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+/* Rows that fit in the session's allocated input workspace, which can be
+ * smaller than the context accepted by ds4_session_sync. */
+int ds4_session_input_workspace_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);

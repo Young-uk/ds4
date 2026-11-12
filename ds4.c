@@ -86257,6 +86257,14 @@ int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
 
+int ds4_session_input_workspace_cap(ds4_session *s) {
+    if (!s) return 0;
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s->qwen4_graph_ready) return (int)s->qwen4_graph.cap_tokens;
+#endif
+    return (int)s->prefill_cap;
+}
+
 #ifndef DS4_NO_GPU
 /* Test the actual compressor frontiers, not just a short continuation whose
  * raw attention window can hide a stale speculative prefix. */
