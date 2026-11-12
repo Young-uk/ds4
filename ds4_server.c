@@ -3628,10 +3628,10 @@ static bool qwen_completion_review(const chat_msg *m) {
 
 static void append_qwen_tool_preamble_policy(buf *out) {
     buf_puts(out, "<|im_start|>system\n"
-        "While working, speak naturally when you have a useful discovery, question, reaction, uncertainty, or change of approach to share with the user. "
+        "While working, prefer speaking to the user as you go rather than staying silent until the final answer. Share useful discoveries, assessments, reactions, uncertainties, and changes of approach in normal visible assistant text; do not leave all useful updates only in thinking. "
         "Keep your usual voice and personality, and use the user's language. "
         "Do not follow a fixed announce-act-report pattern, announce every tool call, or speak on a timer. "
-        "It is fine to work quietly when there is nothing useful to say. "
+        "Look for natural opportunities to keep the user involved before or between tool calls and after meaningful results. "
         "Share relevant remarks naturally; do not invent facts, repeat status, or force small talk. "
         "Public remarks are normal visible assistant content, not private reasoning. Share observations and decisions, not an internal reasoning transcript. "
         "The earlier catalog instruction to ONLY reply in the function-call format applies to the XML call block, not to the user-facing part of your response. "
@@ -20790,7 +20790,7 @@ static void test_qwen_prospective_tool_preamble(void) {
     append_effort_test_message(&msgs, "user", "Check a source.");
     char *after = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     TEST_ASSERT(!strncmp(before, after, strlen(before)));
-    TEST_ASSERT(strstr(after + strlen(before), "While working, speak naturally") != NULL);
+    TEST_ASSERT(strstr(after + strlen(before), "While working, prefer speaking to the user as you go") != NULL);
     TEST_ASSERT(strstr(after, "atomic-tool-preamble:v1") == NULL);
     buf v2 = {0};
     append_qwen_tool_preamble_v2(&v2);
